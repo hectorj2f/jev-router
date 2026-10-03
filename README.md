@@ -139,9 +139,10 @@ and gets a sharper answer.
 
 **This does not work on conversational prompts, and you should not wire it to
 your session model.** The same policy over 26 real session prompts routes
-*nothing* to haiku, while ten described tasks route four. Nine of the 26 score
-below the haiku line — "yes, do it" scores 0.13 — and all nine are correctly
-held, because `mechanical` never exceeds 0.60 on a conversational prompt.
+*nothing* to haiku, while ten described tasks route four (two, for the reworded
+set shipped in `examples/`). Nine of the 26 score below the haiku line — "yes,
+do it" scores 0.13 — and all nine are correctly held, because `mechanical` never
+exceeds 0.60 on a conversational prompt.
 
 That's not a tuning problem. "yes, do it" scored 0.13 and meant *run a ten-task
 routing experiment across two model tiers*. The low score is an artifact of a
