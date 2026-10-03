@@ -1,0 +1,5 @@
+# Memoized Jev answers. Local state, and keyed by the text of real tasks.
+cache/
+
+__pycache__/
+*.py[cod]

@@ -1,0 +1,42 @@
+[
+  {
+    "id": "gofmt-fixtures",
+    "task": "Run gofmt on internal/store/release_load.go and commit the result."
+  },
+  {
+    "id": "bump-dep",
+    "task": "Bump golang.org/x/net to v0.38.0 across every go.mod in the repo and run go mod tidy."
+  },
+  {
+    "id": "read-count",
+    "task": "Report the value of the maxRetries constant in internal/worker/retry.go."
+  },
+  {
+    "id": "rename-field",
+    "task": "Rename the field Deadline to ExpiresAt on the Lease struct and update every reference."
+  },
+  {
+    "id": "find-callers",
+    "task": "Find every caller of ResolveTier across the repo and list them with file and line."
+  },
+  {
+    "id": "alert-docs",
+    "task": "Write the description and troubleshooting steps for the queue-depth alert, so an on-call engineer can act on it without reading the Terraform."
+  },
+  {
+    "id": "binding-guard",
+    "task": "Decide whether the new binding guard should reject or coerce a tier that came back short, and implement it."
+  },
+  {
+    "id": "force-push",
+    "task": "Rebase the branch onto a fresh main and force-push it."
+  },
+  {
+    "id": "tf-apply",
+    "task": "Apply the staging Terraform stage and confirm the new service came up."
+  },
+  {
+    "id": "design-epoch",
+    "task": "Design the epoch-rollover scheme for the store's tiers, weighing the trade-offs against the existing landing projection."
+  }
+]
