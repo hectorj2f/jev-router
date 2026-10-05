@@ -72,6 +72,26 @@ subagent dispatch now gets a model chosen for it. The hook respects an explicit 
 `subagent_type: "fork"` (a fork always inherits the parent model), and swallows
 every exception, so it can never block a dispatch.
 
+### Check the ladder first if you're on Vertex or Bedrock
+
+```bash
+python3 -c 'import sys; sys.path.insert(0,"."); import policy; print(policy.available_tiers())'
+```
+
+Claude Code resolves each tier alias through `ANTHROPIC_DEFAULT_<TIER>_MODEL`
+and falls back to a built-in ID when one is unset. On the first-party API that
+fallback always works. On Vertex and Bedrock it names a model your project may
+never have been granted — so the router drops any tier you haven't pinned
+there, because routing to a model the endpoint lacks is strictly worse than
+not routing: the dispatch dies on a 404 instead of running on the model it
+would otherwise have used.
+
+If that guess is wrong in either direction, say so explicitly:
+
+```bash
+export JEV_TIERS=sonnet,opus      # or haiku,sonnet,opus
+```
+
 ### Try it without installing anything
 
 Route a single task and see the whole decision:
@@ -265,6 +285,20 @@ policy, same work, two tiers apart.
 
 `bump-dep` moved the other way for the same reason: dropping the specific
 version and file count took it from haiku to sonnet.
+
+**The cheapest tier may not exist, and failing open doesn't save you.** The
+hook swallows every exception so it can never block a dispatch — but it cannot
+catch an error that happens *after* it returns. On a Vertex project with no
+haiku granted, the router correctly read a one-file lookup as haiku work,
+emitted `model: haiku`, and the agent died on
+`model_not_found: claude-haiku-4-5@20251001`. The dispatch didn't fall back to
+the session model; it just failed.
+
+So the ladder is now built from what the endpoint serves, and a tier that
+isn't served is clamped *upward* — the same task routes `opus → sonnet`, which
+is a smaller saving and a live agent. The general shape: fail-open is a
+property of the hook's own code paths, not of the decision it hands downstream,
+and a decision that is cheap but unservable is worse than no decision at all.
 
 **Feeding in session context doesn't poison the read — it just mostly isn't
 the missing piece.** The obvious response to "the router sees the prompt, not

@@ -69,6 +69,9 @@ def detail(r: dict, default: str) -> None:
 
     effort = f"   effort {r['effort']}" if r["effort"] else ""
     print(f"  model        {r['model']}{effort}")
+    if r["wanted"] != r["suggested"]:
+        print(f"               {r['wanted']} is not served here, so {r['suggested']} is "
+              f"the floor; ladder is {', '.join(r['tiers'])}")
     if r["held"]:
         print(f"               held at {default}; {r['suggested']} was suggested but "
               f"a downgrade needs mechanical > 0.75 or confidence >= 0.70")

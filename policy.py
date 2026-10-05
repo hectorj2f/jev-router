@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import sys
 import time
@@ -91,6 +92,45 @@ OPUS_LINE = 0.60
 SONNET_LINE = 0.25
 
 
+def available_tiers() -> list[str]:
+    """The tiers this machine can actually serve, cheapest first.
+
+    Routing to a model the endpoint does not have is worse than not routing:
+    the dispatch dies on a 404 instead of running on the model it would have
+    used. Measured the hard way on a Vertex project with no haiku enabled --
+    the hook correctly picked haiku and the agent came back
+    `model_not_found: claude-haiku-4-5@20251001`.
+
+    Claude Code resolves each tier alias through ANTHROPIC_DEFAULT_<TIER>_MODEL
+    and falls back to a built-in ID when one is unset. On the first-party API
+    that fallback is always valid; on Vertex and Bedrock it names a model the
+    project may never have been granted, so an unset tier there is a tier we
+    cannot assume. Override with JEV_TIERS=sonnet,opus.
+    """
+    explicit = os.environ.get("JEV_TIERS", "").strip()
+    if explicit:
+        want = {t.strip() for t in explicit.split(",")}
+        return [t for t in TIERS if t in want] or list(TIERS)
+
+    if not (os.environ.get("CLAUDE_CODE_USE_VERTEX")
+            or os.environ.get("CLAUDE_CODE_USE_BEDROCK")):
+        return list(TIERS)
+
+    pinned = [t for t in TIERS if os.environ.get(f"ANTHROPIC_DEFAULT_{t.upper()}_MODEL")]
+    # Nothing pinned means the deployment leaves every alias to the fallback,
+    # which tells us nothing either way -- guessing a narrower ladder from that
+    # would disable routing wholesale on a perfectly healthy setup.
+    return pinned or list(TIERS)
+
+
+def nearest_tier(tier: str, avail: list[str]) -> str:
+    """`tier` if it is served, else the next one up. Never silently cheaper."""
+    for t in TIERS[TIERS.index(tier):]:
+        if t in avail:
+            return t
+    return avail[-1] if avail else tier
+
+
 def ask(state: str, cache: bool = True) -> dict:
     """Jev's raw answers for one task, memoized on disk by the task text.
 
@@ -117,8 +157,9 @@ def ask(state: str, cache: bool = True) -> dict:
     return answers
 
 
-def decide(ans: dict, default: str = "sonnet") -> dict:
+def decide(ans: dict, default: str = "sonnet", tiers: list[str] | None = None) -> dict:
     """Turn Jev's answers into a tier, applying the asymmetric gates."""
+    avail = tiers if tiers is not None else available_tiers()
     depth = ans["depth"]["score"] / (len(QUESTIONS["depth"]["criteria"]) - 1)
     breadth = ans["breadth"]["score"] / (len(QUESTIONS["breadth"]["criteria"]) - 1)
     conf = min(ans["depth"]["confidence"], ans["breadth"]["confidence"])
@@ -132,7 +173,8 @@ def decide(ans: dict, default: str = "sonnet") -> dict:
     # wrong response to it. See `advice` below.
     need = 0.60 * depth + 0.40 * breadth - 0.25 * mechanical
 
-    suggested = "opus" if need >= OPUS_LINE else "sonnet" if need >= SONNET_LINE else "haiku"
+    wanted = "opus" if need >= OPUS_LINE else "sonnet" if need >= SONNET_LINE else "haiku"
+    suggested = nearest_tier(wanted, avail)
 
     # An upgrade is ungated: if `need` clears the bar, take it, even when Jev is
     # unsure. Measured over ten real tasks, a confidence floor on the upgrade did
@@ -159,6 +201,11 @@ def decide(ans: dict, default: str = "sonnet") -> dict:
         "conf": round(conf, 3),
         "suggested": suggested,
         "held": model != suggested,
+        # What the score alone asked for, before the ladder was narrowed to what
+        # this endpoint serves. Differs from `suggested` only when a tier is
+        # missing, and that is worth seeing rather than silently absorbing.
+        "wanted": wanted,
+        "tiers": avail,
         # Irreversibility and ambiguity do not belong in the tier. A cheap model
         # posting the right comment is fine; what the irreversibility is asking
         # for is a confirmation step, and what the ambiguity is asking for is a

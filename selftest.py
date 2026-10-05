@@ -11,6 +11,7 @@ answers are cached, so a second run is free and deterministic.
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -36,10 +37,11 @@ def fake_transcript(tmp: pathlib.Path, model: str = "claude-opus-5") -> str:
     return str(p)
 
 
-def run(event) -> tuple[int, str]:
+def run(event, env: dict | None = None) -> tuple[int, str]:
     payload = event if isinstance(event, str) else json.dumps(event)
     r = subprocess.run([sys.executable, str(HOOK)], input=payload,
-                       capture_output=True, text=True, timeout=60)
+                       capture_output=True, text=True, timeout=60,
+                       env={**os.environ, **(env or {})})
     return r.returncode, r.stdout.strip()
 
 
@@ -93,6 +95,20 @@ def main() -> int:
                        description="design epoch rollover", prompt=DEEP))
     check("deep task stays on opus", code == 0 and out == "",
           f"rewrote to {routed_model(out)!r}" if out else "")
+
+    # A tier the endpoint cannot serve must never be emitted. Routing to a
+    # missing model is strictly worse than not routing: the dispatch dies on a
+    # 404 rather than running on the model it would otherwise have used.
+    ev = ti(subagent_type="general-purpose", description="read one value",
+            prompt="Report the value of the maxRetries constant in internal/worker/retry.go.")
+    code, out = run(ev, env={"JEV_TIERS": "sonnet,opus"})
+    m = routed_model(out)
+    check("never routes to an unavailable tier", code == 0 and m in (None, "sonnet"),
+          f"routed to {m!r} with haiku off the ladder")
+
+    code, out = run(ev, env={"JEV_TIERS": "haiku,sonnet,opus"})
+    check("routes to haiku when it is available", code == 0 and routed_model(out) == "haiku",
+          f"routed to {routed_model(out)!r} with haiku on the ladder")
 
     # The whole tool_input must come back, since updatedInput replaces it.
     code, out = run(ti(subagent_type="general-purpose", description="gofmt a file",
