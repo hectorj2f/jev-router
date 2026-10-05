@@ -98,6 +98,66 @@ near a threshold can flip.
 Piped without `--table` it emits JSON suitable as `args` to
 `routed-fanout.workflow.js`.
 
+## Verifying it works
+
+**1. The hook's logic, without Claude Code.** Drives `hook_agent.py` with
+synthetic `PreToolUse` events and asserts both the routing and every fail-open
+path. Needs a Jev key; answers are cached, so re-runs are free.
+
+```bash
+./selftest.py
+```
+
+```
+PASS  fork is never rerouted
+PASS  explicit model wins
+PASS  unreadable transcript
+PASS  missing tool_input
+PASS  empty object
+PASS  malformed stdin
+PASS  off-ladder session model declines
+PASS  mechanical task leaves opus
+PASS  deep task stays on opus
+PASS  updatedInput preserves every original key
+
+10/10 passed
+```
+
+The two routing cases assert *not opus* and *stays opus* rather than exact
+tiers, since Jev drifts between calls and a task near a threshold can flip.
+
+**2. What your subagents actually ran on.** The hook rewriting `model` proves
+only that the hook ran — this proves Claude Code honoured it. Subagent
+transcripts live at
+`~/.claude/projects/<slug>/<session-id>/subagents/agent-*.jsonl` and record the
+model on every assistant turn.
+
+```bash
+./verify.py --project ~/your/repo --all
+```
+
+```
+session ddce018e-6787-449c-a080-12fbe80314fc
+  Backcompat + axlotl compat review                      opus-5
+  Security review of PyPI lane                           opus-5
+  CSV data integrity audit                               opus-5
+  ...
+```
+
+That is a ten-way review fan-out *before* the hook: every agent on opus,
+including the ones doing bookkeeping.
+
+**3. The A/B.** Run `verify.py` to capture the baseline, install the hook,
+dispatch a mixed batch — something mechanical (*"run gofmt on X and commit"*)
+alongside something deep (*"decide whether the guard should reject or coerce,
+and implement it"*) — then re-run `verify.py`. The mechanical ones should come
+back on a cheaper tier and the deep ones should still say opus.
+
+If nothing changes, check in this order: the hook is registered in
+`~/.claude/settings.json`; `claude --debug` shows it firing on `Agent`;
+`./selftest.py` still passes; and the dispatch didn't already name a `model`,
+which the hook deliberately respects.
+
 ## Findings
 
 Measured over ten described tasks and 26 verbatim prompts from a real Claude
@@ -194,6 +254,8 @@ customer-derived.
 | `hook_agent.py` | the `PreToolUse` hook. The recommended entry point |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
+| `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |
+| `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
 
 ## License
