@@ -97,30 +97,42 @@ def available_tiers() -> list[str]:
 
     Routing to a model the endpoint does not have is worse than not routing:
     the dispatch dies on a 404 instead of running on the model it would have
-    used. Measured the hard way on a Vertex project with no haiku enabled --
-    the hook correctly picked haiku and the agent came back
-    `model_not_found: claude-haiku-4-5@20251001`.
+    used, and the hook cannot catch that -- it happens after the hook returns.
 
-    Claude Code resolves each tier alias through ANTHROPIC_DEFAULT_<TIER>_MODEL
-    and falls back to a built-in ID when one is unset. On the first-party API
-    that fallback is always valid; on Vertex and Bedrock it names a model the
-    project may never have been granted, so an unset tier there is a tier we
-    cannot assume. Override with JEV_TIERS=sonnet,opus.
+    JEV_TIERS wins; otherwise this reads what `./probe.py` measured. There was
+    an inference here once -- "pinned in the environment, therefore served" --
+    and it was wrong in the expensive direction: a Vertex project pinned
+    ANTHROPIC_DEFAULT_SONNET_MODEL to a model it had never been granted, so the
+    tier the inference was surest of was the one that 404'd. With no probe on
+    file, assume the full ladder rather than guess a narrower one, and let the
+    first dead dispatch send you to probe.py.
     """
     explicit = os.environ.get("JEV_TIERS", "").strip()
     if explicit:
         want = {t.strip() for t in explicit.split(",")}
         return [t for t in TIERS if t in want] or list(TIERS)
 
-    if not (os.environ.get("CLAUDE_CODE_USE_VERTEX")
-            or os.environ.get("CLAUDE_CODE_USE_BEDROCK")):
+    try:
+        rec = json.loads((CACHE_DIR / "tiers.json").read_text())
+        recorded, resolved = rec["tiers"], rec.get("resolved", {})
+    except (OSError, json.JSONDecodeError, KeyError):
         return list(TIERS)
 
-    pinned = [t for t in TIERS if os.environ.get(f"ANTHROPIC_DEFAULT_{t.upper()}_MODEL")]
-    # Nothing pinned means the deployment leaves every alias to the fallback,
-    # which tells us nothing either way -- guessing a narrower ladder from that
-    # would disable routing wholesale on a perfectly healthy setup.
-    return pinned or list(TIERS)
+    out = []
+    for t in TIERS:
+        if t not in recorded:
+            continue
+        # The probe measured one specific model ID. If the environment now
+        # points this alias somewhere else, that measurement is about a
+        # different model and says nothing about the one that would be used.
+        was = resolved.get(t)
+        if was and was != "(built-in default)" and \
+                os.environ.get(f"ANTHROPIC_DEFAULT_{t.upper()}_MODEL") != was:
+            continue
+        out.append(t)
+    # Everything stale means the record describes some other environment, which
+    # is no more informative than having none. Re-run ./probe.py.
+    return out or list(TIERS)
 
 
 def nearest_tier(tier: str, avail: list[str]) -> str:

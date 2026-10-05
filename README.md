@@ -72,25 +72,43 @@ subagent dispatch now gets a model chosen for it. The hook respects an explicit 
 `subagent_type: "fork"` (a fork always inherits the parent model), and swallows
 every exception, so it can never block a dispatch.
 
-### Check the ladder first if you're on Vertex or Bedrock
+### Find out which tiers you can actually serve
 
 ```bash
-python3 -c 'import sys; sys.path.insert(0,"."); import policy; print(policy.available_tiers())'
+./probe.py
 ```
 
-Claude Code resolves each tier alias through `ANTHROPIC_DEFAULT_<TIER>_MODEL`
-and falls back to a built-in ID when one is unset. On the first-party API that
-fallback always works. On Vertex and Bedrock it names a model your project may
-never have been granted — so the router drops any tier you haven't pinned
-there, because routing to a model the endpoint lacks is strictly worse than
-not routing: the dispatch dies on a 404 instead of running on the model it
-would otherwise have used.
+Routing to a model your endpoint lacks is strictly worse than not routing: the
+dispatch dies on a 404 rather than running on the model it would otherwise
+have used, and the hook can't catch that because it happens after the hook
+returns. So measure once and record it:
 
-If that guess is wrong in either direction, say so explicitly:
+```
+provider     vertex
+  haiku    SKIP    unpinned; set ANTHROPIC_DEFAULT_HAIKU_MODEL to use this tier
+  sonnet   GONE    claude-sonnet-4@20250514  -- HTTP 404 Publisher model ... not found
+  opus     OK      claude-opus-5
+
+ladder       opus
+```
+
+Claude Code resolves each tier alias through `ANTHROPIC_DEFAULT_<TIER>_MODEL`,
+falling back to a built-in ID when unset — always valid on the first-party API,
+not necessarily granted on Vertex or Bedrock. The probe pings whichever ID the
+alias really resolves to, so it catches both an unpinned tier and a tier pinned
+to something your project doesn't have. The result lands in `cache/tiers.json`
+and is re-checked against the environment on every read, so moving a pin
+invalidates it rather than silently routing on a stale measurement.
+
+Re-run it whenever you change an `ANTHROPIC_DEFAULT_*` variable. Bedrock isn't
+probeable this way; declare it yourself. Either way `JEV_TIERS` wins:
 
 ```bash
-export JEV_TIERS=sonnet,opus      # or haiku,sonnet,opus
+export JEV_TIERS=sonnet,opus
 ```
+
+A one-tier ladder is a working state, not an error — there's nothing to route
+between, so the hook leaves every dispatch alone.
 
 ### Try it without installing anything
 
@@ -177,10 +195,17 @@ PASS  malformed stdin
 PASS  off-ladder session model declines
 PASS  mechanical task leaves opus
 PASS  deep task stays on opus
+PASS  single-tier ladder routes nothing
+PASS  never routes to an unavailable tier
+PASS  routes to haiku when it is available
 PASS  updatedInput preserves every original key
 
-10/10 passed
+13/13 passed
 ```
+
+The routing cases pin `JEV_TIERS` so they test the policy rather than your
+Vertex grants — on a one-tier endpoint the hook correctly routes nothing, and
+a red light that means "your project lacks sonnet" is testing the wrong thing.
 
 The two routing cases assert *not opus* and *stays opus* rather than exact
 tiers, since Jev drifts between calls and a task near a threshold can flip.
@@ -292,13 +317,21 @@ catch an error that happens *after* it returns. On a Vertex project with no
 haiku granted, the router correctly read a one-file lookup as haiku work,
 emitted `model: haiku`, and the agent died on
 `model_not_found: claude-haiku-4-5@20251001`. The dispatch didn't fall back to
-the session model; it just failed.
+the session model; it just failed. Fail-open is a property of the hook's own
+code paths, not of the decision it hands downstream.
 
-So the ladder is now built from what the endpoint serves, and a tier that
-isn't served is clamped *upward* — the same task routes `opus → sonnet`, which
-is a smaller saving and a live agent. The general shape: fail-open is a
-property of the hook's own code paths, not of the decision it hands downstream,
-and a decision that is cheap but unservable is worse than no decision at all.
+The first fix was an inference — *the tier is pinned in the environment, so it
+must work* — and it was wrong in the direction that costs you an agent. The
+same project pinned `ANTHROPIC_DEFAULT_SONNET_MODEL` to `claude-sonnet-4@20250514`,
+a model it had never been granted, so the tier the inference was surest of was
+the second one to 404. Pinning a model and being able to call it are unrelated
+facts, and only one of them is observable from the environment.
+
+Hence `probe.py`: ping each alias's real target once, record the result, and
+re-validate the record against the environment on every read. A tier that
+isn't served is clamped *upward*, never down — a smaller saving and a live
+agent. The general shape: a cheap decision that can't be served is worse than
+no decision, and an environment is a thing to measure rather than infer.
 
 **Feeding in session context doesn't poison the read — it just mostly isn't
 the missing piece.** The obvious response to "the router sees the prompt, not
@@ -360,6 +393,7 @@ customer-derived.
 | `jev.py` | zero-dependency client for `POST /v1/systemone`; backs off on 429/529, normalises confidence across all three primitives (`noul` returns none, so it computes `\|2p − 1\|`) |
 | `hook_agent.py` | the `PreToolUse` hook. The recommended entry point |
 | `install.py` | registers/removes the hook in `~/.claude/settings.json`, with a backup |
+| `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |

@@ -85,15 +85,29 @@ def main() -> int:
     # Routing. Asserted as "not opus" / "stays opus" rather than an exact tier,
     # because Jev drifts by a few hundredths between calls and a task sitting on
     # a threshold can legitimately flip.
+    #
+    # JEV_TIERS is pinned for these two so they test the policy rather than the
+    # machine: on an endpoint serving only one tier the hook correctly routes
+    # nothing, and a green/red signal that flips with your Vertex grants is
+    # testing the wrong thing.
+    FULL = {"JEV_TIERS": "haiku,sonnet,opus"}
+
     code, out = run(ti(subagent_type="general-purpose",
-                       description="gofmt a file", prompt=MECHANICAL))
+                       description="gofmt a file", prompt=MECHANICAL), env=FULL)
     m = routed_model(out)
     check("mechanical task leaves opus", code == 0 and m is not None and m != "opus",
           f"routed to {m!r}")
 
     code, out = run(ti(subagent_type="general-purpose",
-                       description="design epoch rollover", prompt=DEEP))
+                       description="design epoch rollover", prompt=DEEP), env=FULL)
     check("deep task stays on opus", code == 0 and out == "",
+          f"rewrote to {routed_model(out)!r}" if out else "")
+
+    # A one-tier ladder has nothing to route between, and must not emit the one
+    # tier it has as though that were a decision.
+    code, out = run(ti(subagent_type="general-purpose", description="gofmt a file",
+                       prompt=MECHANICAL), env={"JEV_TIERS": "opus"})
+    check("single-tier ladder routes nothing", code == 0 and out == "",
           f"rewrote to {routed_model(out)!r}" if out else "")
 
     # A tier the endpoint cannot serve must never be emitted. Routing to a
@@ -112,7 +126,7 @@ def main() -> int:
 
     # The whole tool_input must come back, since updatedInput replaces it.
     code, out = run(ti(subagent_type="general-purpose", description="gofmt a file",
-                       prompt=MECHANICAL, extra_key="preserve me"))
+                       prompt=MECHANICAL, extra_key="preserve me"), env=FULL)
     ok = False
     if out:
         upd = json.loads(out)["hookSpecificOutput"]["updatedInput"]
