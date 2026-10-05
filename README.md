@@ -100,6 +100,13 @@ to something your project doesn't have. The result lands in `cache/tiers.json`
 and is re-checked against the environment on every read, so moving a pin
 invalidates it rather than silently routing on a stale measurement.
 
+Run it from inside Claude Code — `! ./probe.py` — not from a bare terminal.
+Claude Code injects its *resolved* tier defaults into the environment of the
+processes it spawns, so a probe run there tests the IDs that will really be
+used; the same probe in a login shell sees those variables unset and can only
+report the tier as unpinned. Both answers are conservative, but only the first
+tells you a tier is actually missing rather than merely unconfigured.
+
 Re-run it whenever you change an `ANTHROPIC_DEFAULT_*` variable. Bedrock isn't
 probeable this way; declare it yourself. Either way `JEV_TIERS` wins:
 
