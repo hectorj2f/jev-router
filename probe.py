@@ -135,12 +135,28 @@ def main() -> int:
             good.append(tier)
         print(f"  {tier:<8} {'OK ' if ok else 'GONE'}    {model}{'' if ok else f'  -- {why}'}")
 
+    if not good:
+        # Finding nothing is a failed measurement, not a measurement of
+        # nothing, and writing it would overwrite a good record with a blank.
+        # On Vertex with not one alias pinned, the overwhelmingly likely cause
+        # is the environment: Claude Code resolves these into the processes it
+        # spawns, so a probe that cannot see any of them is running outside
+        # that -- a plain terminal, or Claude Code's `!` prefix.
+        print("\nno tier could be confirmed -- not recording, leaving any previous\n"
+              "measurement in place.")
+        if prov == "vertex" and not any(resolved.values()):
+            print("\nNothing is pinned at all, which usually means this probe cannot see\n"
+                  "Claude Code's resolved model config. Run it from a Claude Code tool\n"
+                  "context rather than a bare shell or the `!` prefix -- or set the\n"
+                  "ANTHROPIC_DEFAULT_*_MODEL variables where this process can read them.")
+        return 1
+
     TIERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     TIERS_FILE.write_text(json.dumps(
         {"tiers": good, "resolved": resolved, "provider": prov,
          "probed_at": time.strftime("%Y-%m-%dT%H:%M:%S")}, indent=2) + "\n")
 
-    print(f"\nladder       {', '.join(good) or '(none)'}")
+    print(f"\nladder       {', '.join(good)}")
     print(f"recorded     {TIERS_FILE}")
     if len(good) < 2:
         print("\nFewer than two tiers means there is nothing to route between -- the hook\n"

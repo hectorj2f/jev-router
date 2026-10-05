@@ -100,12 +100,17 @@ to something your project doesn't have. The result lands in `cache/tiers.json`
 and is re-checked against the environment on every read, so moving a pin
 invalidates it rather than silently routing on a stale measurement.
 
-Run it from inside Claude Code — `! ./probe.py` — not from a bare terminal.
-Claude Code injects its *resolved* tier defaults into the environment of the
-processes it spawns, so a probe run there tests the IDs that will really be
-used; the same probe in a login shell sees those variables unset and can only
-report the tier as unpinned. Both answers are conservative, but only the first
-tells you a tier is actually missing rather than merely unconfigured.
+**It has to run where the hook runs.** Claude Code resolves each tier to a
+concrete model and injects that into the processes it spawns — the hook, and
+its own tool calls. A probe run anywhere else, including Claude Code's `!`
+prefix and a plain terminal, sees none of those variables and reports every
+tier unpinned, which is a fact about the probe's environment and not about
+your endpoint. Ask Claude to run `./probe.py` for you, so it executes in the
+same environment the hook will.
+
+If every tier comes back unpinned on Vertex, that's the symptom: it recorded
+nothing and told you so rather than overwriting a good measurement with a
+blank.
 
 Re-run it whenever you change an `ANTHROPIC_DEFAULT_*` variable. Bedrock isn't
 probeable this way; declare it yourself. Either way `JEV_TIERS` wins:
@@ -115,7 +120,9 @@ export JEV_TIERS=sonnet,opus
 ```
 
 A one-tier ladder is a working state, not an error — there's nothing to route
-between, so the hook leaves every dispatch alone.
+between, so the hook leaves every dispatch alone. So is no ladder at all: with
+nothing confirmed serviceable, the only model known to work is the one the
+session is already on, and every decision clamps to it.
 
 ### Try it without installing anything
 

@@ -130,9 +130,14 @@ def available_tiers() -> list[str]:
                 os.environ.get(f"ANTHROPIC_DEFAULT_{t.upper()}_MODEL") != was:
             continue
         out.append(t)
-    # Everything stale means the record describes some other environment, which
-    # is no more informative than having none. Re-run ./probe.py.
-    return out or list(TIERS)
+    # Deliberately NOT `or list(TIERS)`. A record that yields nothing -- empty,
+    # or wholly stale -- is a failed measurement, and falling back to the full
+    # ladder turns that into permission to emit a tier nothing has ever
+    # confirmed. Returning empty disables routing instead (see decide), which
+    # is the direction that costs a saving rather than an agent. No record at
+    # all still means the full ladder: that is the un-probed default, not a
+    # measurement that came back blank.
+    return out
 
 
 def nearest_tier(tier: str, avail: list[str]) -> str:
@@ -172,6 +177,10 @@ def ask(state: str, cache: bool = True) -> dict:
 def decide(ans: dict, default: str = "sonnet", tiers: list[str] | None = None) -> dict:
     """Turn Jev's answers into a tier, applying the asymmetric gates."""
     avail = tiers if tiers is not None else available_tiers()
+    # Nothing known to be serviceable: the one model we can be sure this
+    # endpoint serves is the one the session is already running on. Clamping to
+    # it makes every decision a no-op rather than a guess.
+    avail = avail or [default]
     depth = ans["depth"]["score"] / (len(QUESTIONS["depth"]["criteria"]) - 1)
     breadth = ans["breadth"]["score"] / (len(QUESTIONS["breadth"]["criteria"]) - 1)
     conf = min(ans["depth"]["confidence"], ans["breadth"]["confidence"])
