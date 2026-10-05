@@ -78,7 +78,7 @@ def report(session: pathlib.Path) -> tuple[int, int]:
         return 0, 0
 
     print(f"\nsession {session.name}")
-    failed = 0
+    failed, last_failed = 0, False
     for j in subs:
         meta_path = j.with_suffix(".meta.json")
         meta = {}
@@ -89,6 +89,7 @@ def report(session: pathlib.Path) -> tuple[int, int]:
                 pass
         desc = (meta.get("description") or meta.get("name") or j.stem)[:52]
         models, failure = models_in(j)
+        last_failed = bool(failure)
         if failure:
             failed += 1
             print(f"  {desc:<54} FAILED  {failure}")
@@ -97,7 +98,7 @@ def report(session: pathlib.Path) -> tuple[int, int]:
         # the hook cannot do -- worth seeing rather than collapsing.
         shown = ", ".join(m.replace("claude-", "") for m in models)
         print(f"  {desc:<54} {shown or '(no assistant turn)'}")
-    return len(subs), failed
+    return len(subs), failed, last_failed
 
 
 def main() -> None:
@@ -124,13 +125,20 @@ def main() -> None:
         picked = found if a.all else found[:1]
 
     counts = [report(s) for s in picked]
-    total = sum(n for n, _ in counts)
-    failed = sum(f for _, f in counts)
+    total = sum(n for n, _, _ in counts)
+    failed = sum(f for _, f, _ in counts)
     print(f"\n{total} subagent(s) across {len(picked)} session(s)"
           + (f", {failed} failed" if failed else ""))
-    if failed:
-        print("A dispatch that fails on an unavailable model was routed to a tier this\n"
-              "endpoint does not serve. Run ./probe.py to record what it does serve.")
+    # Only chase a failure that is still the latest word. Transcripts are
+    # permanent, so a session that hit an unavailable model once and was then
+    # fixed would otherwise print this advice forever.
+    if failed and any(last for _, _, last in counts):
+        print("The most recent dispatch failed on an unavailable model, so it was routed\n"
+              "to a tier this endpoint does not serve. Run ./probe.py from a Claude Code\n"
+              "tool context to record what it does.")
+    elif failed:
+        print("Those failures predate the newest dispatch, which succeeded -- most likely\n"
+              "already fixed. Transcripts are permanent, so they stay listed.")
 
 
 if __name__ == "__main__":
