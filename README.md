@@ -66,6 +66,37 @@ every exception, so it can never block a dispatch.
 
 ### Try it without installing anything
 
+Route a single task and see the whole decision:
+
+```bash
+./route.py --default opus "Apply the staging Terraform stage and confirm the new service came up."
+```
+
+```
+  model        opus   effort high
+               held at opus; haiku was suggested but a downgrade needs mechanical > 0.75 or confidence >= 0.70
+  need          0.15  haiku ...........#..|.........|........... opus
+  confidence    0.00
+
+  signals
+    depth         1.33/4  ~ Little. Look something up and report it.
+    breadth       1.27/4  ~ One file or one small package.
+    mechanical    0.69
+    irreversible  0.93
+    ambiguous     0.83
+
+  advice
+    writes something hard to undo -- confirm before running
+    under-specified -- ask back rather than guess
+```
+
+That one output is the whole policy: Jev reads the task as small, the gate
+refuses the downgrade anyway because it is unsure (confidence 0.00) and the
+task isn't quite mechanical enough (0.69, against a 0.75 bar), and the fact
+that it applies Terraform becomes a confirmation step rather than a tier.
+
+Several tasks at once give the table instead:
+
 ```bash
 ./route.py --default opus --table < examples/shards.json
 ```
