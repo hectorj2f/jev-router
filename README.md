@@ -227,6 +227,40 @@ policy, same work, two tiers apart.
 `bump-dep` moved the other way for the same reason: dropping the specific
 version and file count took it from haiku to sonnet.
 
+**Feeding in session context doesn't poison the read — it just mostly isn't
+the missing piece.** The obvious response to "the router sees the prompt, not
+the work" is to put the conversation in the state. `experiments/context_dilution.py`
+measures both directions of that.
+
+Contamination barely exists. A trivial task — *"report the value of the
+maxRetries constant"* — held haiku through 12k chars of unrelated hard
+conversation, `need` moving only 0.05 → 0.12 at confidence 0.86–0.99, and it
+*saturated*: 4× and 16× filler score identically. Jev locates the task rather
+than averaging the state.
+
+Enrichment is real, and narrow. An opaque pointer, *"review PR #4471 and tell
+me whether it is safe to merge"*:
+
+| state | depth | breadth | need |
+|---|---|---|---|
+| bare (56 chars) | 2.7 | **1.02** | 0.49 |
+| + resolved PR facts (384 chars) | 2.06 | **3.05** | 0.60 |
+| + hard conversation instead (815 chars) | 3.09 | 2.33 | 0.68 |
+
+Breadth tripled once the state said *31 files, +2847 −1193* — exactly the
+signal the router had been guessing at. Note the third row: raw conversation
+moved `need` too, and further, but via `depth` and to a worse breadth. It is
+difficulty by association, not information about the work, so it happens to
+point the right way here and won't in general.
+
+So the instrument is a few hundred characters of resolved reference, not bulk
+transcript. Cost isn't the argument — 32k tokens of state is $0.0013. The
+arguments are that the cache keys on state text, so conversation in the state
+means every call is unique and always cold; that shipping a whole conversation
+to a third party discloses far more than shipping a task description; and that
+on the surface this actually hooks, dispatch prompts are already written to
+stand alone, so the parent session's context describes the wrong thing.
+
 This is the central finding again, at a smaller scale — the router reads the
 description, so an under-described task gets under-served. If you hit a
 false-cheap, the first thing to check is the prompt, and the next lever is
@@ -257,6 +291,7 @@ customer-derived.
 | `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
+| `experiments/context_dilution.py` | whether session context in the state helps the router or buries the task |
 
 ## License
 
