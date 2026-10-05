@@ -18,9 +18,17 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 
 PROJECTS = pathlib.Path.home() / ".claude" / "projects"
+
+# A dispatch that died before its first real turn records `<synthetic>` as the
+# model and carries the failure in the message text. That case matters more
+# here than any other -- a router that picks a model the endpoint cannot serve
+# kills the agent, and the symptom is a transcript with no model in it.
+SYNTHETIC = "<synthetic>"
+FAILED_MODEL = re.compile(r"selected model \(([^)]+)\)")
 
 
 def slug(path: pathlib.Path) -> str:
@@ -34,8 +42,17 @@ def sessions(project_dir: pathlib.Path) -> list[pathlib.Path]:
     return sorted(out, key=lambda d: (d / "subagents").stat().st_mtime, reverse=True)
 
 
-def models_in(jsonl: pathlib.Path) -> list[str]:
-    seen = []
+def text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return ""
+
+
+def models_in(jsonl: pathlib.Path) -> tuple[list[str], str | None]:
+    """Models this agent ran on, and why it died if it did."""
+    seen, failure = [], None
     for line in jsonl.read_text(errors="replace").splitlines():
         try:
             e = json.loads(line)
@@ -43,19 +60,25 @@ def models_in(jsonl: pathlib.Path) -> list[str]:
             continue
         if e.get("type") != "assistant":
             continue
+        if e.get("isApiErrorMessage"):
+            body = text_of(e.get("message", {}).get("content"))
+            hit = FAILED_MODEL.search(body)
+            failure = f"{hit.group(1)} unavailable" if hit else body[:70].strip()
+            continue
         m = e.get("message", {}).get("model")
-        if m and m not in seen:
+        if m and m != SYNTHETIC and m not in seen:
             seen.append(m)
-    return seen
+    return seen, failure
 
 
-def report(session: pathlib.Path) -> int:
+def report(session: pathlib.Path) -> tuple[int, int]:
     subs = sorted((session / "subagents").glob("agent-*.jsonl"),
                   key=lambda p: p.stat().st_mtime)
     if not subs:
-        return 0
+        return 0, 0
 
     print(f"\nsession {session.name}")
+    failed = 0
     for j in subs:
         meta_path = j.with_suffix(".meta.json")
         meta = {}
@@ -65,11 +88,16 @@ def report(session: pathlib.Path) -> int:
             except json.JSONDecodeError:
                 pass
         desc = (meta.get("description") or meta.get("name") or j.stem)[:52]
-        models = models_in(j) or ["(no assistant turn)"]
+        models, failure = models_in(j)
+        if failure:
+            failed += 1
+            print(f"  {desc:<54} FAILED  {failure}")
+            continue
         # More than one model in a single subagent means a mid-run switch, which
         # the hook cannot do -- worth seeing rather than collapsing.
-        print(f"  {desc:<54} {', '.join(m.replace('claude-', '') for m in models)}")
-    return len(subs)
+        shown = ", ".join(m.replace("claude-", "") for m in models)
+        print(f"  {desc:<54} {shown or '(no assistant turn)'}")
+    return len(subs), failed
 
 
 def main() -> None:
@@ -95,8 +123,14 @@ def main() -> None:
                      f"  dispatch an agent first, then re-run this.")
         picked = found if a.all else found[:1]
 
-    total = sum(report(s) for s in picked)
-    print(f"\n{total} subagent(s) across {len(picked)} session(s)")
+    counts = [report(s) for s in picked]
+    total = sum(n for n, _ in counts)
+    failed = sum(f for _, f in counts)
+    print(f"\n{total} subagent(s) across {len(picked)} session(s)"
+          + (f", {failed} failed" if failed else ""))
+    if failed:
+        print("A dispatch that fails on an unavailable model was routed to a tier this\n"
+              "endpoint does not serve. Run ./probe.py to record what it does serve.")
 
 
 if __name__ == "__main__":
