@@ -50,17 +50,25 @@ git clone https://github.com/hectorj2f/jev-router ~/jev-router
 chmod +x ~/jev-router/*.py
 ```
 
-Add to `~/.claude/settings.json`:
+Then register the hook:
+
+```bash
+~/jev-router/install.py             # --check to see the state, --uninstall to undo
+```
+
+It backs up `~/.claude/settings.json`, merges rather than replaces, and
+re-running swaps its own entry instead of stacking a second one. If you'd
+rather do it by hand, the entry is:
 
 ```json
 "hooks": {
   "PreToolUse": [{"matcher": "^Agent$",
-                  "hooks": [{"type": "command", "command": "~/jev-router/hook_agent.py", "timeout": 8}]}]
+                  "hooks": [{"type": "command", "command": "/absolute/path/to/hook_agent.py", "timeout": 8}]}]
 }
 ```
 
-Hooks hot-reload — no restart. Every subagent dispatch now gets a model chosen
-for it. The hook respects an explicit `model` in the dispatch, skips
+Hooks hot-reload — no restart, and it applies to sessions already open. Every
+subagent dispatch now gets a model chosen for it. The hook respects an explicit `model` in the dispatch, skips
 `subagent_type: "fork"` (a fork always inherits the parent model), and swallows
 every exception, so it can never block a dispatch.
 
@@ -317,6 +325,7 @@ customer-derived.
 | `policy.py` | the questions, scoring, gates, cache, transcript readers. The only copy of the policy — everything imports it |
 | `jev.py` | zero-dependency client for `POST /v1/systemone`; backs off on 429/529, normalises confidence across all three primitives (`noul` returns none, so it computes `\|2p − 1\|`) |
 | `hook_agent.py` | the `PreToolUse` hook. The recommended entry point |
+| `install.py` | registers/removes the hook in `~/.claude/settings.json`, with a backup |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |
