@@ -50,7 +50,20 @@ git clone https://github.com/hectorj2f/jev-router ~/jev-router
 chmod +x ~/jev-router/*.py
 ```
 
-Then register the hook:
+Then pick a front end. There are two, they do the same thing, and they read the
+same `policy.py` — **run one or the other, not both**, or every dispatch gets
+priced twice.
+
+### As a mod — Claude Code 2.1.287 or later
+
+```bash
+claude plugin marketplace add ~/jev-router
+claude plugin install jev-router@jev-router
+```
+
+Or `claude --plugin-dir ~/jev-router` for one session, without installing.
+
+### As a PreToolUse hook — any version
 
 ```bash
 ~/jev-router/install.py             # --check to see the state, --uninstall to undo
@@ -67,15 +80,33 @@ rather do it by hand, the entry is:
 }
 ```
 
-Hooks hot-reload — no restart, and it applies to sessions already open. Every
-subagent dispatch now gets a model chosen for it. The hook respects an explicit `model` in the dispatch, skips
-`subagent_type: "fork"` (a fork always inherits the parent model), and swallows
-every exception, so it can never block a dispatch.
+Hooks hot-reload — no restart, and it applies to sessions already open.
+
+### Either way
+
+Every subagent dispatch now gets a model chosen for it. Both front ends respect
+an explicit `model` in the dispatch, skip forks (a fork always inherits the
+parent model), and fail open, so neither can block a dispatch.
+
+The mod is the better of the two where you can run it, because the facts the
+hook has to go and find arrive as fields of the event it listens to, and
+because it listens to more than the `Agent` tool:
+
+| | `hook_agent.py` | the mod |
+|---|---|---|
+| the session's tier | parsed back out of the transcript file | `e.parentModel`, already resolved |
+| is this a fork | inferred from `subagent_type` | `e.fork` |
+| did the caller pick a model | read out of the raw tool input | `e.model` |
+| agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch |
+
+It also carries two commands, `/jev-probe` and `/jev-route`, which are the
+next two sections.
 
 ### Find out which tiers you can actually serve
 
 ```bash
-./probe.py
+/jev-probe          # from the mod
+./probe.py          # same script, see the warning below about where you run it
 ```
 
 Routing to a model your endpoint lacks is strictly worse than not routing: the
@@ -105,8 +136,10 @@ concrete model and injects that into the processes it spawns — the hook, and
 its own tool calls. A probe run anywhere else, including Claude Code's `!`
 prefix and a plain terminal, sees none of those variables and reports every
 tier unpinned, which is a fact about the probe's environment and not about
-your endpoint. Ask Claude to run `./probe.py` for you, so it executes in the
-same environment the hook will.
+your endpoint. `/jev-probe` exists for exactly this: the mod's subprocess
+inherits Claude Code's own environment, so the probe sees what the router will
+see. Without the mod, ask Claude to run `./probe.py` for you, which gets you
+the same thing by a longer road.
 
 If every tier comes back unpinned on Vertex, that's the symptom: it recorded
 nothing and told you so rather than overwriting a good measurement with a
@@ -149,6 +182,10 @@ Route a single task and see the whole decision:
     writes something hard to undo -- confirm before running
     under-specified -- ask back rather than guess
 ```
+
+From inside Claude Code the mod spells the same thing `/jev-route <task>`,
+defaulting to the tier the session is already on rather than asking you to
+name it.
 
 That one output is the whole policy: Jev reads the task as small, the gate
 refuses the downgrade anyway because it is unsure (confidence 0.00) and the
@@ -224,7 +261,19 @@ a red light that means "your project lacks sonnet" is testing the wrong thing.
 The two routing cases assert *not opus* and *stays opus* rather than exact
 tiers, since Jev drifts between calls and a task near a threshold can flip.
 
-**2. What your subagents actually ran on.** The hook rewriting `model` proves
+**2. The mod's logic, without Jev.** The same assertions against the event the
+mod sees, with `route.py` stood in for, so no task leaves the machine and no
+key is needed.
+
+```bash
+claude plugin test ~/jev-router
+```
+
+These are the one part of this repo that has never been run: they were written
+on 2.1.267, where `claude plugin test` does not exist yet. Read a failure
+before believing it.
+
+**3. What your subagents actually ran on.** The hook rewriting `model` proves
 only that the hook ran — this proves Claude Code honoured it. Subagent
 transcripts live at
 `~/.claude/projects/<slug>/<session-id>/subagents/agent-*.jsonl` and record the
@@ -245,16 +294,16 @@ session ddce018e-6787-449c-a080-12fbe80314fc
 That is a ten-way review fan-out *before* the hook: every agent on opus,
 including the ones doing bookkeeping.
 
-**3. The A/B.** Run `verify.py` to capture the baseline, install the hook,
+**4. The A/B.** Run `verify.py` to capture the baseline, install the hook,
 dispatch a mixed batch — something mechanical (*"run gofmt on X and commit"*)
 alongside something deep (*"decide whether the guard should reject or coerce,
 and implement it"*) — then re-run `verify.py`. The mechanical ones should come
 back on a cheaper tier and the deep ones should still say opus.
 
-If nothing changes, check in this order: the hook is registered in
-`~/.claude/settings.json`; `claude --debug` shows it firing on `Agent`;
-`./selftest.py` still passes; and the dispatch didn't already name a `model`,
-which the hook deliberately respects.
+If nothing changes, check in this order: the front end is actually loaded
+(`claude plugin list` for the mod, an entry in `~/.claude/settings.json` for
+the hook); `claude --debug` shows it firing; `./selftest.py` still passes; and
+the dispatch didn't already name a `model`, which both deliberately respect.
 
 ## Findings
 
@@ -308,11 +357,18 @@ four-word prompt, not evidence of a simple task. **The router sees the prompt,
 not the work.** Dispatch prompts describe the work; chat prompts point at it.
 That gap is the whole reason this hooks `^Agent$` and nothing else.
 
-There is also no mechanism for it even if you wanted one: no hook can set the
-session model (`PreModelSwitch` only allows/denies/asks), the `model` settings
-key is read once at session start, and the first request after any switch
-re-reads the whole conversation uncached. The Agent SDK's `setModel()` is the
-only true mid-session switch.
+This used to say there was no mechanism for it anyway. That is no longer true,
+and the correction is worth making precisely because it changes nothing. A
+mod's `turn.step` hook fires before each step of a turn and may rewrite both
+`model` and `effort`, which is a real mid-session switch and more than
+`PreModelSwitch` (allow/deny/ask) or the `model` settings key (read once at
+session start) ever offered. So the thing is now buildable. The measurements
+above are still the reason not to build it: a router that reads "yes, do it"
+as a 0.13 and downgrades the session is wrong on the one input that matters,
+and giving it the session to be wrong about is worse than giving it a
+dispatch. The remaining cost argument also survives — the first request after
+any switch re-reads the whole conversation uncached, so a router that flips
+tiers mid-turn pays for the context it just saved on.
 
 **How you phrase the task is a tier-level input.** On the private set,
 `alert-docs` routed to **haiku** and shouldn't have — writing alert
@@ -387,6 +443,36 @@ false-cheap, the first thing to check is the prompt, and the next lever is
 raising the confidence floor from 0.70. Do not reach for another signal; that
 was tried and measured as contributing nothing.
 
+## The advice half, still unbuilt
+
+`decide()` returns `advice.confirm` and `advice.clarify`, and nothing has ever
+acted on them. They print. That was defensible when the only front end was a
+`PreToolUse` hook, whose entire vocabulary is a model name — but the finding
+they come from says the response to irreversibility is a confirmation step and
+the response to ambiguity is a question back, and the router currently delivers
+neither. Two sketches, both deliberately not in this PR:
+
+**`confirm` should raise the confirmation posture, not print.** A mod sees
+`tool.check` and can turn one into a prompt, so the shape is obvious: a
+dispatch that scored `irreversible > 0.60` gets its writes confirmed, the rest
+of the session doesn't. The blocker is identity and read/write. `ToolCheckInput`
+in the published declarations is `{tool, input, tool_use_id?}` — no `agentId`,
+so you cannot tell which dispatch a tool call came from, and no `isReadOnly`,
+so you cannot tell a read from a write. The documentation says both exist
+(`agentId` from v2.1.290, `isReadOnly` from v2.1.304); the declarations shipped
+alongside it have neither. Built against what is actually declared, this
+prompts on every tool call in the session, which nobody would keep installed
+for a week. Check the declarations before writing it, not the docs.
+
+**`clarify` should reach the parent before the dispatch does.** A task reading
+`ambiguous > 0.70` is one the subagent will guess at, and the parent is the
+only thing that can resolve it — but it finds out three tool calls later, if at
+all. Saying so at `agent.spawn` costs nothing and the API is already there.
+This one is unbuilt for want of evidence rather than fields: 26 real prompts
+say `ambiguous` reads high on nearly everything (median 0.80), and a warning
+that fires on nearly everything is noise. It needs a threshold measured on
+*dispatch* prompts, which is a measurement nobody has made yet.
+
 ## Cost and privacy
 
 ~$0.00003 per task routed ($0.042/Mtok input, output free). A 50-shard fan-out
@@ -405,12 +491,14 @@ customer-derived.
 |---|---|
 | `policy.py` | the questions, scoring, gates, cache, transcript readers. The only copy of the policy — everything imports it |
 | `jev.py` | zero-dependency client for `POST /v1/systemone`; backs off on 429/529, normalises confidence across all three primitives (`noul` returns none, so it computes `\|2p − 1\|`) |
-| `hook_agent.py` | the `PreToolUse` hook. The recommended entry point |
+| `hooks/register.js` | the mod: routes `agent.spawn`, and serves `/jev-probe` and `/jev-route`. The recommended entry point, on 2.1.287+ |
+| `hook_agent.py` | the `PreToolUse` hook. The entry point below 2.1.287 |
 | `install.py` | registers/removes the hook in `~/.claude/settings.json`, with a backup |
 | `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |
+| `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. Never yet run |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
 | `experiments/context_dilution.py` | whether session context in the state helps the router or buries the task |
