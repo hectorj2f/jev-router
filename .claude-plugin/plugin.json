@@ -1,0 +1,8 @@
+{
+  "name": "jev-router",
+  "version": "0.1.0",
+  "description": "Routes each subagent dispatch to a model, scoring the task with Jev first",
+  "author": { "name": "hectorj2f" },
+  "homepage": "https://github.com/hectorj2f/jev-router",
+  "license": "Apache-2.0"
+}
