@@ -9,6 +9,11 @@ including the ones that say the idea doesn't work. Those are in
 [Findings](#findings), and they are the reason this routes *subagent dispatches*
 and nothing else.
 
+If you want a Jev router that routes *every turn*, you want
+[gargpratyush/jev-router](https://github.com/gargpratyush/jev-router), which is
+older, more complete, and not related to this one. See
+[Related work](#related-work).
+
 ## How it works
 
 Five atomic questions to Jev about the task — `depth` and `breadth` as 5-level
@@ -357,18 +362,33 @@ four-word prompt, not evidence of a simple task. **The router sees the prompt,
 not the work.** Dispatch prompts describe the work; chat prompts point at it.
 That gap is the whole reason this hooks `^Agent$` and nothing else.
 
-This used to say there was no mechanism for it anyway. That is no longer true,
-and the correction is worth making precisely because it changes nothing. A
-mod's `turn.step` hook fires before each step of a turn and may rewrite both
-`model` and `effort`, which is a real mid-session switch and more than
+This used to say there was no mechanism for it anyway. That was wrong when it
+was written, and in two ways.
+
+The one I missed entirely: you do not need a hook. Put a loopback proxy on
+`ANTHROPIC_BASE_URL`, expose a sentinel model in `/model`, and rewrite the
+model on the way out.
+[gargpratyush/jev-router](https://github.com/gargpratyush/jev-router) has
+shipped exactly that since September 2026 — same Jev, same idea, every fresh
+user turn, Claude Code and Codex both, on every CLI version rather than a
+floor. Independent work, earlier than this repo, and it owns the npm name.
+
+The one that arrived since: a mod's `turn.step` hook fires before each step of
+a turn and may rewrite both `model` and `effort`, which is more than
 `PreModelSwitch` (allow/deny/ask) or the `model` settings key (read once at
-session start) ever offered. So the thing is now buildable. The measurements
-above are still the reason not to build it: a router that reads "yes, do it"
-as a 0.13 and downgrades the session is wrong on the one input that matters,
-and giving it the session to be wrong about is worse than giving it a
-dispatch. The remaining cost argument also survives — the first request after
-any switch re-reads the whole conversation uncached, so a router that flips
-tiers mid-turn pays for the context it just saved on.
+session start) ever offered.
+
+So the thing is buildable twice over, and the measurements above are still the
+reason this repo does not build it. A router that reads "yes, do it" as a 0.13
+and downgrades the session is wrong on the one input that matters, and giving
+it the session to be wrong about is worse than giving it a dispatch. The cost
+argument survives too — the first request after any switch re-reads the whole
+conversation uncached, so a router that flips tiers mid-turn pays for the
+context it just saved on.
+
+That is a disagreement about policy, not about capability, and it is the
+honest way to state the difference between the two repos. Nobody has published
+a measurement either way.
 
 **How you phrase the task is a tier-level input.** On the private set,
 `alert-docs` routed to **haiku** and shouldn't have — writing alert
@@ -502,6 +522,46 @@ customer-derived.
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
 | `experiments/context_dilution.py` | whether session context in the state helps the router or buries the task |
+
+## Related work
+
+[gargpratyush/jev-router](https://github.com/gargpratyush/jev-router) is an
+independent project with the same name, the same scorer, and a different
+answer. It came first — 16 September 2026, against 3 October for this one —
+and it owns `jev-router` on npm. Neither repo is a fork of the other; I found
+it after writing this one.
+
+| | that one | this one |
+|---|---|---|
+| mechanism | loopback proxy on `ANTHROPIC_BASE_URL`, with a sentinel model in `/model` | a mod on `agent.spawn`, or a `PreToolUse` hook |
+| scope | every fresh user turn | subagent dispatches only |
+| CLIs | Claude Code and OpenAI Codex | Claude Code |
+| the decision | Jev picks the tier; code adjusts it | Jev answers five atomic questions; code combines them |
+| version floor | none — it sits below the CLI | 2.1.287 for the mod, none for the hook |
+| published measurements | none | [Findings](#findings) |
+
+Use theirs if you want this working today across both CLIs and every turn.
+The reason this repo exists is the last row, and the reason it routes nothing
+but dispatches is the row above it: scoring a conversational turn is the thing
+[Findings](#findings) says does not work, measured over 26 real prompts.
+
+Two places the difference is load-bearing rather than cosmetic:
+
+- **A proxy cannot know the parent's tier.** Their proxy keys each sub-agent as
+  its own conversation, which is right, but the model field on the request is
+  the sentinel, so the session's real tier is erased before the proxy sees it.
+  `src/proxy.mjs` falls back to `state.tier ?? "opus"`, and for a sub-agent the
+  first turn *is* the first decision, so every dispatch is scored against opus
+  whatever the session is on. That is the failure mode in "The default must be
+  the session's own tier" above, and it is architectural rather than a
+  slip — `e.parentModel` is a fact only a hook inside the CLI gets to see.
+- **Catalogued is not granted.** Their tier availability comes from the
+  account's model catalog. On the first-party API that is probably honest. It
+  is the exact inference `probe.py` exists to replace, and the Vertex project
+  that produced that finding would defeat it.
+
+Neither is a reason to prefer this repo over that one today. They are the two
+things worth stealing in the other direction.
 
 ## License
 
