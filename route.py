@@ -28,10 +28,12 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import decisions  # noqa: E402
 import policy  # noqa: E402
 
 
-def route_one(shard: dict, default: str, cache: bool) -> dict:
+def route_one(shard: dict, default: str, cache: bool,
+              session: str | None = None) -> dict:
     out = dict(shard)
     try:
         decision = policy.route(shard["task"], default=default, cache=cache)
@@ -39,8 +41,12 @@ def route_one(shard: dict, default: str, cache: bool) -> dict:
         # Fail open: an unrouted shard runs on the default, it does not fail the
         # fan-out. A router that can take the whole run down with it is worse
         # than no router.
-        return {**out, "model": default, "effort": policy.EFFORT[default],
-                "why": f"jev error: {e}"}
+        decision = {"model": default, "effort": policy.EFFORT[default],
+                    "why": f"jev error: {e}"}
+    # Logged including the failures, which is the half of "did it even fire"
+    # that nothing else answers.
+    decisions.record(session or "", str(shard.get("id") or "task"), default,
+                     decision, shard["task"])
     return {**out, **decision}
 
 
@@ -101,6 +107,29 @@ def detail(r: dict, default: str) -> None:
     print()
 
 
+def table(routed: list[dict], column: str = "shard") -> None:
+    """A fan-out at a glance. Shared with explain.py, which replays one.
+
+    `column` only names the first heading: a replay is a list of dispatches
+    that happened, not of shards about to run.
+    """
+    hdr = f"{column:<28} {'model':<7} {'need':>5} {'conf':>5}  advice"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in routed:
+        if "why" in r:
+            print(f"{r['id'][:28]:<28} {r['model']:<7} {'--':>5} {'--':>5}  {r['why']}")
+            continue
+        notes = [k for k, v in r["advice"].items() if v]
+        if r["held"]:
+            notes.append(f"held from {r['suggested']}")
+        print(f"{r['id'][:28]:<28} {r['model']:<7} {r['need']:>5.2f} {r['conf']:>5.2f}  "
+              f"{', '.join(notes) or '-'}")
+
+    tally = {t: sum(1 for r in routed if r["model"] == t) for t in policy.TIERS}
+    print("\n" + ", ".join(f"{tally[t]}x{t}" for t in policy.TIERS))
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("task", nargs="*",
@@ -110,6 +139,8 @@ def main() -> None:
     p.add_argument("--table", action="store_true", help="human-readable output")
     p.add_argument("--json", action="store_true", help="JSON, even for positional tasks")
     p.add_argument("--no-cache", action="store_true", help="bypass the disk cache")
+    p.add_argument("--session", default="",
+                   help="record each decision under this session id, for explain.py")
     p.add_argument("--workers", type=int, default=12)
     args = p.parse_args()
 
@@ -126,7 +157,8 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         routed = list(pool.map(
-            lambda s: route_one(s, args.default, not args.no_cache), shards))
+            lambda s: route_one(s, args.default, not args.no_cache, args.session),
+            shards))
 
     # A single task typed by hand wants the reasoning; a pipe wants JSON.
     if args.json or not (args.table or args.task):
@@ -138,21 +170,7 @@ def main() -> None:
         detail(routed[0], args.default)
         return
 
-    hdr = f"{'shard':<28} {'model':<7} {'need':>5} {'conf':>5}  advice"
-    print(hdr)
-    print("-" * len(hdr))
-    for r in routed:
-        if "why" in r:
-            print(f"{r['id'][:28]:<28} {r['model']:<7} {'--':>5} {'--':>5}  {r['why']}")
-            continue
-        notes = [k for k, v in r["advice"].items() if v]
-        if r["held"]:
-            notes.append(f"held from {r['suggested']}")
-        print(f"{r['id'][:28]:<28} {r['model']:<7} {r['need']:>5.2f} {r['conf']:>5.2f}  "
-              f"{', '.join(notes) or '-'}")
-
-    tally = {t: sum(1 for r in routed if r["model"] == t) for t in policy.TIERS}
-    print("\n" + ", ".join(f"{tally[t]}x{t}" for t in policy.TIERS))
+    table(routed)
 
 
 if __name__ == "__main__":

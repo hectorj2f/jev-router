@@ -16,6 +16,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import decisions  # noqa: E402
 import policy  # noqa: E402
 
 STATE_LIMIT = 60_000
@@ -39,10 +40,19 @@ def main() -> None:
     if default is None:
         return  # unreadable, or off-ladder (fable): decline rather than guess
 
-    state = (f"Agent type: {ti.get('subagent_type') or 'general-purpose'}\n"
+    agent = ti.get("subagent_type") or "general-purpose"
+    state = (f"Agent type: {agent}\n"
              f"Description: {ti.get('description') or ''}\n"
              f"Task:\n{ti.get('prompt') or ''}")
     plan = policy.route(state[:STATE_LIMIT], default=default)
+
+    # Before the early return, not after: a decision that changed nothing is
+    # still a decision, and it is the one /jev-explain exists to show.
+    session = ev.get("session_id") or pathlib.Path(
+        ev.get("transcript_path") or "").stem
+    decisions.record(session, ti.get("description") or agent, default, plan,
+                     state)
+
     if plan["model"] == default:
         return
 

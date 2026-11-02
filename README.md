@@ -104,8 +104,8 @@ because it listens to more than the `Agent` tool:
 | did the caller pick a model | read out of the raw tool input | `e.model` |
 | agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch |
 
-It also carries two commands, `/jev-probe` and `/jev-route`, which are the
-next two sections.
+It also carries three commands — `/jev-probe`, `/jev-route` and
+`/jev-explain` — which are the next three sections.
 
 ### Find out which tiers you can actually serve
 
@@ -231,6 +231,66 @@ near a threshold can flip.
 Piped without `--table` it emits JSON suitable as `args` to
 `routed-fanout.workflow.js`.
 
+### See what it decided
+
+```bash
+/jev-explain        # from the mod, scoped to the session you are in
+./explain.py        # from a shell, the most recently written log
+```
+
+A routing decision is invisible by construction. It is made before the agent
+starts, the only trace it leaves is a model id on a transcript nobody opens,
+and by the time the work comes back wrong the reasoning is gone. Worse, both
+front ends return early when the decision matches the tier already in use — so
+a hold doing its job has always looked exactly like the router not running.
+
+Every decision is now appended to `cache/decisions/<session>.jsonl`, including
+the ones that changed nothing, and `explain.py` reads them back:
+
+```
+session 018f2c91-...: 4 decisions, 6m ago to 40s ago
+
+decision                     model    need  conf  advice
+--------------------------------------------------------
+1  review the retry guard    opus     0.71  0.48  clarify
+2  gofmt the fixtures        haiku   -0.09  0.91  -
+3  bump the pinned dep       opus     0.22  0.14  held from sonnet
+4  design epoch rollover     opus     0.86  0.71  clarify
+
+1xhaiku, 0xsonnet, 3xopus
+
+./explain.py <n> for everything behind one of them
+```
+
+The table is the default view because a dispatch router decides many times in
+one session, and a wrong decision is visible as the row that looks unlike its
+neighbours — one bookkeeping task on opus, or six in a row held. A single
+decision shown alone has nothing to look unlike. `./explain.py 3` then prints
+everything behind one of them, in the same layout `./route.py` uses for a task
+scored by hand: the task text, the gate that fired, the five signals.
+
+```bash
+./explain.py 3              # everything behind decision 3
+./explain.py --last         # the most recent one
+./explain.py --sessions     # every session with a log
+./explain.py --session <id> # one that isn't the newest
+./explain.py --json         # the records themselves
+```
+
+This is the other half of the `verify.py` join. `verify.py` reports what each
+subagent actually ran on; the log reports what it was supposed to run on and
+why, so a disagreement between the two localises to the engine rather than the
+policy.
+
+The log holds dispatches only — `/jev-route` prints its reasoning on the spot
+and isn't recorded. It is pruned at seven days, task text is cut at 4,000
+characters with the original length kept alongside, and `cache/` is
+gitignored. `JEV_DECISIONS_DIR` moves it.
+
+The idea is [gargpratyush/jev-router](https://github.com/gargpratyush/jev-router)'s
+— see [Related work](#related-work). Theirs explains one decision, because a
+proxy that routes conversational turns has exactly one live at a time.
+
 ## Verifying it works
 
 **1. The hook's logic, without Claude Code.** Drives `hook_agent.py` with
@@ -255,8 +315,16 @@ PASS  single-tier ladder routes nothing
 PASS  never routes to an unavailable tier
 PASS  routes to haiku when it is available
 PASS  updatedInput preserves every original key
+PASS  a decision survives a round trip
+PASS  a long task is cut, and says how long it was
+PASS  records accumulate in order
+PASS  a session with a log can be found without being named
+PASS  a torn line costs one record, not the log
+PASS  a session id cannot escape the log dir
+PASS  no session id, no log
+PASS  a decision that changed nothing is still logged
 
-13/13 passed
+21/21 passed
 ```
 
 The routing cases pin `JEV_TIERS` so they test the policy rather than your
@@ -265,6 +333,9 @@ a red light that means "your project lacks sonnet" is testing the wrong thing.
 
 The two routing cases assert *not opus* and *stays opus* rather than exact
 tiers, since Jev drifts between calls and a task near a threshold can flip.
+
+The log cases point `JEV_DECISIONS_DIR` at a temp directory, so a self-test
+run never lands in the log you then read with `./explain.py`.
 
 **2. The mod's logic, without Jev.** The same assertions against the event the
 mod sees, with `route.py` stood in for, so no task leaves the machine and no
@@ -305,10 +376,13 @@ alongside something deep (*"decide whether the guard should reject or coerce,
 and implement it"*) — then re-run `verify.py`. The mechanical ones should come
 back on a cheaper tier and the deep ones should still say opus.
 
-If nothing changes, check in this order: the front end is actually loaded
-(`claude plugin list` for the mod, an entry in `~/.claude/settings.json` for
-the hook); `claude --debug` shows it firing; `./selftest.py` still passes; and
-the dispatch didn't already name a `model`, which both deliberately respect.
+If nothing changes, start with `./explain.py`, which separates the two cases
+that used to look identical: an empty log means the front end never fired, and
+a log full of holds means it fired and the gate refused. Then, in order: the
+front end is actually loaded (`claude plugin list` for the mod, an entry in
+`~/.claude/settings.json` for the hook); `claude --debug` shows it firing;
+`./selftest.py` still passes; and the dispatch didn't already name a `model`,
+which both deliberately respect.
 
 ## Findings
 
@@ -505,17 +579,25 @@ paths, and whatever else is in the prompt. That is a real disclosure decision,
 not a footnote. Think hard before pointing this at anything whose inputs can be
 customer-derived.
 
+The decision log keeps the first 4,000 characters of each of those tasks on
+disk for seven days, in `cache/`, which is gitignored and goes nowhere. It is
+a second copy of text already sent to Jev rather than a new exposure, but it
+is a copy that outlives the session, so it is worth knowing about. `rm -rf
+cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
+
 ## Files
 
 | | |
 |---|---|
 | `policy.py` | the questions, scoring, gates, cache, transcript readers. The only copy of the policy — everything imports it |
 | `jev.py` | zero-dependency client for `POST /v1/systemone`; backs off on 429/529, normalises confidence across all three primitives (`noul` returns none, so it computes `\|2p − 1\|`) |
-| `hooks/register.js` | the mod: routes `agent.spawn`, and serves `/jev-probe` and `/jev-route`. The recommended entry point, on 2.1.287+ |
+| `hooks/register.js` | the mod: routes `agent.spawn`, and serves `/jev-probe`, `/jev-route` and `/jev-explain`. The recommended entry point, on 2.1.287+ |
 | `hook_agent.py` | the `PreToolUse` hook. The entry point below 2.1.287 |
 | `install.py` | registers/removes the hook in `~/.claude/settings.json`, with a backup |
 | `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
+| `decisions.py` | the append-only decision log, one JSONL file per session. Written by both front ends, including the decisions that changed nothing |
+| `explain.py` | reads the log back: the session as a table, then everything behind any one row |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |
 | `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. Never yet run |
@@ -562,6 +644,14 @@ Two places the difference is load-bearing rather than cosmetic:
 
 Neither is a reason to prefer this repo over that one today. They are the two
 things worth stealing in the other direction.
+
+Stolen in this direction: `/jev-explain`, theirs first. Their version renders
+the current decision, which is the right shape for a proxy — routing
+conversational turns, there is one decision live at a time and no history to
+compare it against. A dispatch router makes several at once, so
+[the version here](#see-what-it-decided) logs them all and leads with the
+table. The thing worth copying was the observation that a router which cannot
+account for itself is a router you cannot debug.
 
 ## License
 

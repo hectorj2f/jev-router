@@ -21,6 +21,11 @@ import { test, expect } from 'claude-code/testing'
 import type { AgentSpawnInput, On } from 'claude-code'
 
 const PARENT = 'claude-opus-5'
+const SESSION = 'sess_test'
+
+// What the dispatch is called in the log and in the one-line report: the
+// description, which is the only field written for a human to read.
+const LABEL = 'rename Deadline'
 
 const STATE = [
   'Agent type: general-purpose',
@@ -46,7 +51,7 @@ function dispatch(over: Partial<AgentSpawnInput> = {}): AgentSpawnInput {
 /** One element of the array route.py --json prints, with the keys it prints. */
 function decision(over: Record<string, unknown> = {}) {
   return JSON.stringify([{
-    id: 'spawn',
+    id: LABEL,
     task: STATE,
     model: 'sonnet',
     effort: 'medium',
@@ -84,6 +89,7 @@ function stub(on: On, out: { exitCode?: number; stdout?: string } = {}) {
     spawned.push(e.model ?? e.parentModel)
     return { model: e.model ?? e.parentModel, agentId: 'agent_test' }
   })
+  on('session.id', async () => SESSION)
 
   return { runs, spawned }
 }
@@ -94,7 +100,19 @@ test('a dispatch is priced on its type, its description and its task', async ($,
   await $.agent.spawn(dispatch())
 
   expect(runs).toHaveLength(1)
-  expect(JSON.parse(runs[0].stdin ?? '')).toEqual([{ id: 'spawn', task: STATE }])
+  expect(JSON.parse(runs[0].stdin ?? '')).toEqual([{ id: LABEL, task: STATE }])
+})
+
+test('the decision is logged against the session that made it', async ($, on) => {
+  // route.py writes the log, not this file, and it only writes when it is told
+  // which session to write under. Drop the flag and /jev-explain goes quiet
+  // while everything else keeps working, which is the failure nobody notices.
+  const { runs } = stub(on)
+
+  await $.agent.spawn(dispatch())
+
+  expect(runs[0].argv).toContain('--session')
+  expect(runs[0].argv[runs[0].argv.indexOf('--session') + 1]).toBe(SESSION)
 })
 
 test("the parent's own tier is what the task is scored against", async ($, on) => {
@@ -196,7 +214,7 @@ test('a jev error reaches the dispatch as the tier it already had', async ($, on
   // route.py catches a failed call and routes the shard to the default, with
   // `why` set. That is a report, not a decision to act on.
   const { spawned } = stub(on, {
-    stdout: JSON.stringify([{ id: 'spawn', task: STATE, model: 'opus', effort: 'high', why: 'jev error: 503' }]),
+    stdout: JSON.stringify([{ id: LABEL, task: STATE, model: 'opus', effort: 'high', why: 'jev error: 503' }]),
   })
 
   await $.agent.spawn(dispatch())
@@ -230,7 +248,11 @@ test('a missing description and type still make a scorable state', async ($, on)
 
   await $.agent.spawn(dispatch({ description: '', subagentType: '' }))
 
-  expect(JSON.parse(runs[0].stdin ?? '')[0].task).toBe(
+  const sent = JSON.parse(runs[0].stdin ?? '')[0]
+  expect(sent.task).toBe(
     'Agent type: general-purpose\nDescription: \nTask:\nRename the Deadline field and fix every caller',
   )
+  // The far end of the label's fallback chain. A log row with no name in it is
+  // still a row, and an empty one would sort and truncate strangely.
+  expect(sent.id).toBe('dispatch')
 })

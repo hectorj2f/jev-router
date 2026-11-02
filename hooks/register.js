@@ -33,6 +33,9 @@ const ROUTE_TIMEOUT_MS = 6_000
 // Vertex shells out to gcloud first.
 const PROBE_TIMEOUT_MS = 120_000
 
+// explain.py only reads a log off local disk.
+const EXPLAIN_TIMEOUT_MS = 10_000
+
 /** The tier a resolved model id belongs to, or null for one off the ladder. */
 function tierOf(model) {
   for (const tier of TIERS) if (String(model || '').includes(tier)) return tier
@@ -44,11 +47,16 @@ function tierOf(model) {
  *
  * Piped rather than passed as argv: route.py reads a JSON array on stdin, and
  * a 60k task description has no business on a command line.
+ *
+ * The session id goes down with it so route.py writes the decision to the log
+ * /jev-explain reads back. Recording on that side rather than this one means
+ * the held decisions are logged too -- they return early here, by design.
  */
-async function routeOne($, state, parent) {
+async function routeOne($, state, parent, label, session) {
   const run = await $.process.run(
-    [`${$.plugin.root}/route.py`, '--default', parent, '--json'],
-    { stdin: JSON.stringify([{ id: 'spawn', task: state }]), timeoutMs: ROUTE_TIMEOUT_MS },
+    [`${$.plugin.root}/route.py`, '--default', parent, '--session', session,
+      '--json'],
+    { stdin: JSON.stringify([{ id: label, task: state }]), timeoutMs: ROUTE_TIMEOUT_MS },
   )
   if (run.exitCode !== 0) return null
   const routed = JSON.parse(run.stdout)
@@ -86,6 +94,10 @@ export function register(on) {
       name: 'jev-route',
       description: 'Score one task by hand and show the whole decision',
     })
+    await $.command.register({
+      name: 'jev-explain',
+      description: 'What the router decided this session, and why',
+    })
     return next(e)
   })
 
@@ -113,6 +125,8 @@ export function register(on) {
       `Task:\n${e.prompt || ''}`,
     ].join('\n').slice(0, STATE_LIMIT)
 
+    const label = (e.description || e.subagentType || 'dispatch').slice(0, 48)
+
     // No .catch handler on this registration, deliberately. A hook that fails
     // before calling next is skipped and the spawn proceeds on the model it
     // would otherwise have used, which is already the behaviour we want; a
@@ -125,13 +139,12 @@ export function register(on) {
     // hook has returned, where nothing can catch it.
     let plan = null
     try {
-      plan = await routeOne($, state, parent)
+      plan = await routeOne($, state, parent, label, String(await $.session.id()))
     } catch {
       return next(e)
     }
     if (!plan) return next(e)
 
-    const label = (e.description || e.subagentType || 'dispatch').slice(0, 48)
     const line = decisionLine(plan, parent, label)
     if (line) $.ui.log(line)
     // Never a deny: a refusal surfaces to the parent as an Agent tool error,
@@ -169,5 +182,20 @@ export function register(on) {
       { timeoutMs: ROUTE_TIMEOUT_MS })
     const out = `${run.stdout}${run.stderr}`.trim()
     return { text: out || `route.py exited ${run.exitCode} and said nothing` }
+  })
+
+  on('command.run', { command: 'jev-explain' }, async ($, e) => {
+    // Pinned to this session unless the user named another one. Left to itself
+    // explain.py takes the most recently written log, which is the right guess
+    // from a shell and the wrong one here: a second Claude running alongside
+    // would have written more recently than the session asking the question.
+    const argv = [`${$.plugin.root}/explain.py`,
+      ...String(e.args || '').trim().split(/\s+/).filter(Boolean)]
+    if (!argv.includes('--sessions') && !argv.includes('--session')) {
+      argv.push('--session', String(await $.session.id()))
+    }
+    const run = await $.process.run(argv, { timeoutMs: EXPLAIN_TIMEOUT_MS })
+    const out = `${run.stdout}${run.stderr}`.trim()
+    return { text: out || `explain.py exited ${run.exitCode} and said nothing` }
   })
 }

@@ -17,6 +17,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import decisions  # noqa: E402
+
 HOOK = pathlib.Path(__file__).resolve().parent / "hook_agent.py"
 
 MECHANICAL = ("Run gofmt on internal/store/release_load.go and commit the "
@@ -37,11 +40,18 @@ def fake_transcript(tmp: pathlib.Path, model: str = "claude-opus-5") -> str:
     return str(p)
 
 
+# Where the hook subprocesses write their decisions. Set in main(), once there
+# is a temp dir to point at: the one thing a self-test must not do is append a
+# hundred synthetic decisions to the log you read with ./explain.py.
+LOGDIR = ""
+
+
 def run(event, env: dict | None = None) -> tuple[int, str]:
     payload = event if isinstance(event, str) else json.dumps(event)
     r = subprocess.run([sys.executable, str(HOOK)], input=payload,
                        capture_output=True, text=True, timeout=60,
-                       env={**os.environ, **(env or {})})
+                       env={**os.environ, "JEV_DECISIONS_DIR": LOGDIR,
+                            **(env or {})})
     return r.returncode, r.stdout.strip()
 
 
@@ -52,7 +62,9 @@ def routed_model(out: str) -> str | None:
 
 
 def main() -> int:
+    global LOGDIR
     tmp = pathlib.Path(tempfile.mkdtemp())
+    LOGDIR = str(tmp / "hooklog")
     t = fake_transcript(tmp)
     ti = lambda **kw: {"transcript_path": t, "tool_input": kw}  # noqa: E731
 
@@ -132,6 +144,66 @@ def main() -> int:
         upd = json.loads(out)["hookSpecificOutput"]["updatedInput"]
         ok = upd.get("extra_key") == "preserve me" and upd.get("prompt") == MECHANICAL
     check("updatedInput preserves every original key", ok, f"got {out[:80]!r}")
+
+    # The decision log, pointed at a temp dir. A self-test that appends to the
+    # log it then reads back is testing the leftovers of the last run.
+    logdir = tmp / "decisions"
+    decisions.LOG_DIR = logdir
+    plan = {"model": "sonnet", "effort": "medium", "need": 0.41, "conf": 0.82}
+
+    decisions.record("sess-a", "rename Deadline", "opus", plan, DEEP)
+    got = decisions.read("sess-a")
+    check("a decision survives a round trip",
+          len(got) == 1 and got[0]["model"] == "sonnet" and got[0]["task"] == DEEP
+          and got[0]["label"] == "rename Deadline" and got[0]["default"] == "opus",
+          f"read back {got!r:.80}")
+
+    long_task = "x" * (decisions.TASK_LIMIT + 500)
+    decisions.record("sess-a", "big", "opus", plan, long_task)
+    got = decisions.read("sess-a")
+    check("a long task is cut, and says how long it was",
+          len(got) == 2 and len(got[1]["task"]) == decisions.TASK_LIMIT
+          and got[1]["task_len"] == len(long_task),
+          f"kept {len(got[-1]['task'])} of {len(long_task)}")
+
+    # Appends rather than rewrites, because the writers are concurrent: a
+    # fan-out is twelve threads, and Claude Code starts dispatches in parallel.
+    check("records accumulate in order",
+          [g["label"] for g in got] == ["rename Deadline", "big"],
+          f"{[g['label'] for g in got]}")
+
+    known = decisions.sessions()
+    check("a session with a log can be found without being named",
+          [s["session"] for s in known] == ["sess-a"] and known[0]["count"] == 2,
+          f"{known!r:.80}")
+
+    with decisions.path_for("sess-a").open("a", encoding="utf-8") as f:
+        f.write('{"at": 1, "label": "killed mid-wri')
+    check("a torn line costs one record, not the log",
+          len(decisions.read("sess-a")) == 2,
+          f"read {len(decisions.read('sess-a'))} records back")
+
+    # The session id arrives from outside and lands in a filename.
+    escape = decisions.path_for("../../etc/passwd")
+    check("a session id cannot escape the log dir", escape.parent == logdir,
+          f"wrote to {escape}")
+
+    decisions.record("", "no session", "opus", plan, DEEP)
+    check("no session id, no log", not (logdir / "unknown.jsonl").exists(),
+          "an unattributed decision was written anyway")
+
+    # The claim the log exists for: the hook returns early when the decision
+    # matches the tier already in use, which is exactly when nothing else can
+    # tell you whether the router ran.
+    code, out = run({**ti(subagent_type="general-purpose",
+                          description="design epoch rollover", prompt=DEEP),
+                     "session_id": "sess-hook"}, env=FULL)
+    decisions.LOG_DIR = pathlib.Path(LOGDIR)
+    logged = decisions.read("sess-hook")
+    check("a decision that changed nothing is still logged",
+          code == 0 and out == "" and len(logged) == 1
+          and logged[0]["model"] == "opus" and logged[0]["default"] == "opus",
+          f"exit={code} out={out[:40]!r} logged {logged!r:.60}")
 
     width = max(len(n) for n, _, _ in cases)
     failed = 0
