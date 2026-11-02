@@ -1,0 +1,12 @@
+{
+  "name": "jev-router",
+  "owner": { "name": "hectorj2f" },
+  "description": "One plugin: the jev-router, which prices a subagent dispatch before choosing its model",
+  "plugins": [
+    {
+      "name": "jev-router",
+      "source": "./",
+      "description": "Routes each subagent dispatch to a model, scoring the task with Jev first"
+    }
+  ]
+}
