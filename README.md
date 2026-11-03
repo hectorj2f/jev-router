@@ -1,8 +1,8 @@
 # jev-router
 
-Pick the Anthropic model for a Claude Code subagent based on what the task
-actually needs, using [TypeSafe's Jev](https://docs.typesafe.ai) to score the
-task first.
+Pick the model for a subagent based on what the task actually needs, using
+[TypeSafe's Jev](https://docs.typesafe.ai) to score the task first. Works on
+Claude Code and on OpenAI Codex, off one copy of the policy.
 
 The interesting part of this repo is not the router. It is the measurements,
 including the ones that say the idea doesn't work. Those are in
@@ -29,7 +29,10 @@ advice = {"confirm": irreversible > 0.60,    # a confirmation step, not a bigger
           "clarify": ambiguous   > 0.70}     # a question back, not a bigger model
 ```
 
-`need >= 0.60` → opus, `>= 0.25` → sonnet, else haiku.
+`need >= 0.60` → the dear rung, `>= 0.25` → the middle one, else the cheap one.
+On Claude that is opus / sonnet / haiku; on Codex, `gpt-6-astra` / `gpt-6.1-sol`
+/ `gpt-6-luna`. The two lines are the same numbers either way — they mark a
+position on a three-rung ladder, and they were measured on Claude's.
 
 **Upgrades are ungated; downgrades must be earned.** Opus on a task that only
 needed Haiku costs a fraction of a cent. Haiku on a task that needed Opus costs
@@ -55,9 +58,9 @@ git clone https://github.com/hectorj2f/jev-router ~/jev-router
 chmod +x ~/jev-router/*.py
 ```
 
-Then pick a front end. There are two, they do the same thing, and they read the
-same `policy.py` — **run one or the other, not both**, or every dispatch gets
-priced twice.
+Then pick a front end. There are three — two for Claude Code, one for Codex —
+they do the same thing, and they read the same `policy.py`. **Run one per
+host, not two**, or every dispatch gets priced twice.
 
 ### As a mod — Claude Code 2.1.287 or later
 
@@ -87,22 +90,56 @@ rather do it by hand, the entry is:
 
 Hooks hot-reload — no restart, and it applies to sessions already open.
 
+### On OpenAI Codex
+
+```bash
+~/jev-router/install.py --codex     # --check to see the state, --uninstall to undo
+```
+
+The front end is `hook_codex.py`, a `PreToolUse` hook matched on `spawn_agent`.
+Install writes `~/.codex/hooks.json` — a *sibling* of `config.toml`, not
+`hooks/hooks.json`, which is the plugin-relative path. It never writes
+`config.toml`, because TOML does not round-trip through a rewrite the way JSON
+does. The matcher needs no anchors: Codex treats a matcher of only word
+characters as an exact name match, so `spawn_agent` is enough.
+
+Codex asks you to trust the hook the first time it loads it, and again after
+any change to the command. If you already declare `[hooks]` in `config.toml`,
+pick one file — Codex loads both and a doubled entry routes every dispatch
+twice.
+
+Codex is the better-placed of the three hosts, for one reason: `PreToolUse`
+hands over the parent's own resolved model as a field, so there is no
+transcript to scrape and `policy.session_tier` has no Codex counterpart at all.
+
+Two precedence rules, both read off the source rather than guessed. A model
+this hook supplies **beats** `[agents] default_subagent_model`, which is only
+the fallback. It **loses** to an `agent_type` role that pins a model of its
+own, because the role is applied after the override.
+
 ### Either way
 
-Every subagent dispatch now gets a model chosen for it. Both front ends respect
-an explicit `model` in the dispatch, skip forks (a fork always inherits the
-parent model), and fail open, so neither can block a dispatch.
+Every subagent dispatch now gets a model chosen for it. All three front ends
+respect an explicit `model` in the dispatch, decline to touch a fork, and fail
+open, so none of them can block a dispatch.
 
-The mod is the better of the two where you can run it, because the facts the
-hook has to go and find arrive as fields of the event it listens to, and
-because it listens to more than the `Agent` tool:
+Failing open matters more on Codex than on Claude: `updatedInput` replaces the
+whole argument object rather than merging into it, and `SpawnAgentArgs` is
+`deny_unknown_fields`, so an argument object this got wrong would kill the
+spawn instead of being ignored. Every error path there exits 0 with no output,
+which leaves the arguments exactly as the model wrote them.
 
-| | `hook_agent.py` | the mod |
-|---|---|---|
-| the session's tier | parsed back out of the transcript file | `e.parentModel`, already resolved |
-| is this a fork | inferred from `subagent_type` | `e.fork` |
-| did the caller pick a model | read out of the raw tool input | `e.model` |
-| agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch |
+On Claude Code the mod is the better of the two where you can run it, because
+the facts the hook has to go and find arrive as fields of the event it listens
+to, and because it listens to more than the `Agent` tool. Codex's hook is in
+the right-hand column's position without needing a mod at all:
+
+| | `hook_agent.py` | the mod | `hook_codex.py` |
+|---|---|---|---|
+| the session's tier | parsed back out of the transcript file | `e.parentModel`, already resolved | `model`, already resolved |
+| is this a fork | inferred from `subagent_type` | `e.fork` | `fork_turns` / `fork_context` |
+| did the caller pick a model | read out of the raw tool input | `e.model` | `tool_input.model` |
+| agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch | n/a |
 
 It also carries three commands — `/jev-probe`, `/jev-route` and
 `/jev-explain` — which are the next three sections.
@@ -161,6 +198,16 @@ A one-tier ladder is a working state, not an error — there's nothing to route
 between, so the hook leaves every dispatch alone. So is no ladder at all: with
 nothing confirmed serviceable, the only model known to work is the one the
 session is already on, and every decision clamps to it.
+
+**On Codex there is nothing to probe.** codex-cli caches the catalogue it was
+served, keyed by a hash of the account, at `~/.codex/models_cache.json`, and
+that file carries a `visibility` and a `supported_in_api` per model. So the
+question `probe.py` has to spend a live request on for Claude is already
+answered on disk, for free, and it is re-read on every decision rather than
+whenever someone last remembered to probe. `JEV_TIERS` still wins. If the
+catalogue can't be read at all the full ladder is assumed, exactly as an
+unprobed Claude does; if it reads and lists none of the three rungs, that is a
+measurement that came back empty and routing stops.
 
 ### Try it without installing anything
 
@@ -337,6 +384,21 @@ tiers, since Jev drifts between calls and a task near a threshold can flip.
 The log cases point `JEV_DECISIONS_DIR` at a temp directory, so a self-test
 run never lands in the log you then read with `./explain.py`.
 
+The Codex hook has its own suite, which needs no key at all — every case pins
+the decision and runs the hook by path, so nothing is sent anywhere:
+
+```bash
+./selftest_codex.py                                      # 22/22
+```
+
+Most of it is the shapes that must *not* route: both fork spellings and all
+four ways `fork_turns` can mean "all", a V1 `fork_context` call, a parent on a
+model off the ladder, malformed stdin, and a spawn of some other tool. Then
+the ones that must: a well-formed `updatedInput` that preserves every other
+key verbatim, an inherited effort replaced rather than left behind, the effort
+key *absent* rather than null when a rung asks for none, and a hold still
+reaching the decision log.
+
 **2. The mod's logic, without Jev.** The same assertions against the event the
 mod sees, with `route.py` stood in for, so no task leaves the machine and no
 key is needed.
@@ -370,6 +432,29 @@ session ddce018e-6787-449c-a080-12fbe80314fc
 That is a ten-way review fan-out *before* the hook: every agent on opus,
 including the ones doing bookkeeping.
 
+On Codex the same job is `./verify_codex.py`. Codex writes one rollout per
+spawned subagent — `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`, plain
+JSONL — rather than nesting them under the parent, so the join is per file:
+`session_meta.source.subagent.thread_spawn.agent_path`'s last segment is the
+spawn's `task_name`, which is the label the hook recorded. Each row gets a
+verdict — `ok`, `OVERRIDDEN`, `OFF LADDER`, `NO TURN`, `UNREADABLE`,
+`UNROUTED` — and it exits non-zero when it cannot verify anything at all.
+
+That last part is the point. The rollout format drifts: ten `cli_version`s
+appear across the 442 rollouts this was built against, with fields appearing
+and disappearing between them. A verifier that answered "all clear" because it
+had failed to parse anything would be worse than none, so an unrecognised
+rollout is reported as one, with the version named.
+
+**Measured here, and worth repeating on your own account before trusting it:**
+across those 442 rollouts, 116 of 116 spawns that named a `model` ran on
+exactly that model — the mechanism works. But every one of those 116 asked for
+`gpt-6-astra`, and only sol and astra have ever run on this machine. So what is
+proven is that an *upgrade* is honoured. A downgrade to `gpt-6-luna` is
+unexercised, and a silently ignored downgrade looks exactly like a dispatch
+that worked. Run `./verify_codex.py` deliberately after your first few
+dispatches: an `OVERRIDDEN` row is what that failure would look like.
+
 **4. The A/B.** Run `verify.py` to capture the baseline, install the hook,
 dispatch a mixed batch — something mechanical (*"run gofmt on X and commit"*)
 alongside something deep (*"decide whether the guard should reject or coerce,
@@ -380,9 +465,14 @@ If nothing changes, start with `./explain.py`, which separates the two cases
 that used to look identical: an empty log means the front end never fired, and
 a log full of holds means it fired and the gate refused. Then, in order: the
 front end is actually loaded (`claude plugin list` for the mod, an entry in
-`~/.claude/settings.json` for the hook); `claude --debug` shows it firing;
-`./selftest.py` still passes; and the dispatch didn't already name a `model`,
-which both deliberately respect.
+`~/.claude/settings.json` for the hook, `./install.py --codex --check` for
+Codex); `claude --debug` shows it firing; `./selftest.py` still passes; and
+the dispatch didn't already name a `model`, which all three deliberately
+respect.
+
+On Codex add two of its own: the hook is only live once you have answered its
+trust prompt, and a dispatch is only routed if it is a fresh spawn — a
+full-history fork is left alone by design.
 
 ## Findings
 
@@ -579,6 +669,15 @@ paths, and whatever else is in the prompt. That is a real disclosure decision,
 not a footnote. Think hard before pointing this at anything whose inputs can be
 customer-derived.
 
+On Codex that decision is sharper than it looks. Codex encrypts the `message`
+of a spawn in its own rollouts — it is stored Fernet-wrapped on disk, which is
+why `verify_codex.py` joins on `task_name` and never on the task text. This
+router reads that same message before it is written and sends it out in the
+clear. Nothing is bypassed and no file is decrypted; the hook simply sits
+upstream of the encryption. But it does mean the content Codex chose to
+protect at rest is content jev-router transmits, and that is worth deciding on
+deliberately rather than discovering later.
+
 The decision log keeps the first 4,000 characters of each of those tasks on
 disk for seven days, in `cache/`, which is gitignored and goes nowhere. It is
 a second copy of text already sent to Jev rather than a new exposure, but it
@@ -589,19 +688,24 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 
 | | |
 |---|---|
-| `policy.py` | the questions, scoring, gates, cache, transcript readers. The only copy of the policy — everything imports it |
+| `policy.py` | the questions, scoring, gates, cache. The only copy of the policy — everything imports it |
+| `providers/` | what differs per host: the ladder, the slugs, the effort each rung takes, and how to find out which rungs are served. `claude.py` also holds the two transcript readers, which have no Codex counterpart |
 | `jev.py` | zero-dependency client for `POST /v1/systemone`; backs off on 429/529, normalises confidence across all three primitives (`noul` returns none, so it computes `\|2p − 1\|`) |
 | `hooks/register.js` | the mod: routes `agent.spawn`, and serves `/jev-probe`, `/jev-route` and `/jev-explain`. The recommended entry point, on 2.1.287+ |
-| `hook_agent.py` | the `PreToolUse` hook. The entry point below 2.1.287 |
-| `install.py` | registers/removes the hook in `~/.claude/settings.json`, with a backup |
+| `hook_agent.py` | the Claude Code `PreToolUse` hook. The entry point below 2.1.287 |
+| `hook_codex.py` | the Codex `PreToolUse` hook on `spawn_agent`. The entry point there |
+| `codex/hooks.json` | the hook declaration, ready to copy into `~/.codex/` by hand |
+| `install.py` | registers/removes the hook in `~/.claude/settings.json`, or in `~/.codex/hooks.json` with `--codex`. Backs up before every write |
 | `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
 | `decisions.py` | the append-only decision log, one JSONL file per session. Written by both front ends, including the decisions that changed nothing |
 | `explain.py` | reads the log back: the session as a table, then everything behind any one row |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
-| `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |
+| `selftest.py` | drives the Claude hook with synthetic events; asserts routing and every fail-open path |
+| `selftest_codex.py` | the same for `hook_codex.py`, with the decision pinned so it needs no key |
 | `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. Never yet run |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
+| `verify_codex.py` | the same against Codex rollouts, joined to the decision log by `task_name`, one verdict per dispatch |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
 | `experiments/context_dilution.py` | whether session context in the state helps the router or buries the task |
 

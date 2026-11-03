@@ -71,11 +71,14 @@ def models_in(jsonl: pathlib.Path) -> tuple[list[str], str | None]:
     return seen, failure
 
 
-def report(session: pathlib.Path) -> tuple[int, int]:
+def report(session: pathlib.Path) -> tuple[int, int, bool]:
     subs = sorted((session / "subagents").glob("agent-*.jsonl"),
                   key=lambda p: p.stat().st_mtime)
     if not subs:
-        return 0, 0
+        # Three, not two. A session whose subagents/ exists but holds no
+        # transcript reaches here, and main() unpacks three -- so the shape
+        # that means "nothing to report" used to be the one that crashed.
+        return 0, 0, False
 
     print(f"\nsession {session.name}")
     failed, last_failed = 0, False

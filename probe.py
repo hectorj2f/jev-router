@@ -34,12 +34,21 @@ import urllib.error
 import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from providers import claude  # noqa: E402
+
 TIERS_FILE = HERE / "cache" / "tiers.json"
-TIERS = ["haiku", "sonnet", "opus"]
+# The ladder comes from the provider rather than being spelled again here. It
+# was spelled again here, and a second copy of a list this file exists to
+# measure is the drift the provider package was added to end.
+TIERS = claude.TIERS
 PING = {"max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
 
 
-def provider() -> str:
+def endpoint() -> str:
+    """Which API serves Claude here -- a different axis from which model family
+    the router is driving. Nothing to probe on Codex: it has no alias to
+    resolve, and codex-cli caches the catalogue it was granted itself."""
     if os.environ.get("CLAUDE_CODE_USE_VERTEX"):
         return "vertex"
     if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
@@ -48,7 +57,7 @@ def provider() -> str:
 
 
 def pinned(tier: str) -> str | None:
-    return os.environ.get(f"ANTHROPIC_DEFAULT_{tier.upper()}_MODEL")
+    return os.environ.get(claude.alias_env(tier))
 
 
 def post(url: str, body: dict, headers: dict) -> tuple[bool, str]:
@@ -106,8 +115,8 @@ def main() -> int:
         print(TIERS_FILE.read_text())
         return 0
 
-    prov = provider()
-    print(f"provider     {prov}")
+    prov = endpoint()
+    print(f"endpoint     {prov}")
     if prov == "bedrock":
         print("\nBedrock probing isn't implemented -- model access there is per-account\n"
               "and not readable from a ping. Declare the ladder yourself:\n"
