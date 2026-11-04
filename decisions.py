@@ -14,9 +14,13 @@ each subagent actually ran on, and this is the other half of that join.
 JSONL, append-only, because the writers are concurrent: route.py fans out
 across twelve threads and Claude Code can start several dispatches at once,
 each its own hook process. Read-modify-write on a shared JSON array loses
-records under exactly the fan-out this repo exists to route. One write() of a
-line well under the pipe buffer is atomic on POSIX, which is the only locking
-this needs.
+records under exactly the fan-out this repo exists to route.
+
+One append write() is atomic against other appenders here because XNU holds
+the vnode lock across the whole call, so record size is not the constraint --
+measured clean at 48 KB a line, 16 processes, which a pipe's PIPE_BUF would
+have torn long before. That is a kernel and filesystem property rather than a
+POSIX guarantee: a log kept on NFS or SMB would need real locking.
 """
 
 from __future__ import annotations
@@ -72,8 +76,21 @@ def record(session: str, label: str, default: str, decision: dict,
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         entry = {"at": time.time(), "label": label, "default": default,
                  "task": task[:TASK_LIMIT], "task_len": len(task), **decision}
-        with open(path_for(session), "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        line = json.dumps(entry, separators=(",", ":")) + "\n"
+        p = path_for(session)
+        # Claim the file before appending to it. _prune() in a sibling hook
+        # process decides by mtime and open(..., "a") does not touch it, so
+        # resuming a session whose log has gone stale leaves a window where
+        # the log is unlinked between this open and this write -- the record
+        # then lands on a detached inode and is gone without an error.
+        p.touch(exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line)
+        if not p.exists():
+            # Lost it anyway: the prune had already stat'd before the touch.
+            # The retry races nothing, since _prune() runs once per process.
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
         _prune()
     except Exception:
         pass

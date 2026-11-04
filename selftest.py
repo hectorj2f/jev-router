@@ -205,6 +205,47 @@ def main() -> int:
           and logged[0]["model"] == "opus" and logged[0]["default"] == "opus",
           f"exit={code} out={out[:40]!r} logged {logged!r:.60}")
 
+    # jev.py exits rather than raises, and SystemExit is not an Exception, so
+    # the record above used to be unreachable on an outage -- which left a dead
+    # API looking exactly like a router that never fired.
+    code, out = run({**ti(subagent_type="general-purpose",
+                          description="rename a variable", prompt=MECHANICAL),
+                     "session_id": "sess-outage"},
+                    env={"HOME": str(tmp / "keyless"), "TYPESAFE_API_KEY": ""})
+    outage = decisions.read("sess-outage")
+    check("a jev outage is logged, not swallowed",
+          code == 0 and out == "" and len(outage) == 1
+          and outage[0]["model"] == "opus"
+          and outage[0].get("why", "").startswith("jev error:"),
+          f"exit={code} out={out[:40]!r} logged {outage!r:.60}")
+
+    # A sibling hook's _prune() decides by mtime, and open(..., "a") does not
+    # touch it, so a resumed session whose log has gone stale can have it
+    # unlinked between this process's open and its write. The writer below
+    # pauses inside that window on purpose: without the claiming touch, its
+    # record and the nine before it vanish with no error raised anywhere.
+    stale = decisions.path_for("sess-stale")
+    stale.write_text("".join(json.dumps({"n": i}) + "\n" for i in range(9)))
+    os.utime(stale, (1, 1))
+    here = str(HOOK.parent)
+    writer = subprocess.Popen(
+        [sys.executable, "-c",
+         f"import builtins,sys,time;sys.path.insert(0,{here!r});"
+         "real=builtins.open;"
+         "builtins.open=lambda *a,**k: ((time.sleep(1.0), real(*a,**k))[1]"
+         "  if str(a[0]).endswith('sess-stale.jsonl') else real(*a,**k));"
+         "import decisions;"
+         "decisions.record('sess-stale','l','opus',{'model':'opus'},'t')"],
+        env={**os.environ, "JEV_DECISIONS_DIR": LOGDIR})
+    subprocess.run([sys.executable, "-c",
+                    f"import sys;sys.path.insert(0,{here!r});"
+                    "import decisions;decisions._prune()"],
+                   env={**os.environ, "JEV_DECISIONS_DIR": LOGDIR}, timeout=60)
+    writer.wait(timeout=60)
+    survived = decisions.read("sess-stale")
+    check("a stale log survives a concurrent prune", len(survived) == 10,
+          f"{len(survived)} records survived, expected 10")
+
     width = max(len(n) for n, _, _ in cases)
     failed = 0
     for name, ok, detail in cases:

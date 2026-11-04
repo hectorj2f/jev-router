@@ -44,7 +44,16 @@ def main() -> None:
     state = (f"Agent type: {agent}\n"
              f"Description: {ti.get('description') or ''}\n"
              f"Task:\n{ti.get('prompt') or ''}")
-    plan = policy.route(state[:STATE_LIMIT], default=default)
+    try:
+        plan = policy.route(state[:STATE_LIMIT], default=default)
+    except SystemExit as e:
+        # jev.py exits rather than raises on a missing key or a dead API, and
+        # SystemExit is not an Exception, so this used to leave the hook's one
+        # logged path -- the record below -- unreached. A Jev outage looked
+        # exactly like a router that never fired, which is the ambiguity the
+        # log exists to remove. route.py:route_one does the same thing.
+        plan = {"model": default, "effort": policy.EFFORT[default],
+                "why": f"jev error: {e}"}
 
     # Before the early return, not after: a decision that changed nothing is
     # still a decision, and it is the one /jev-explain exists to show.
