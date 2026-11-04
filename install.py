@@ -39,9 +39,12 @@ CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME")
 # wholesale to edit: JSON round-trips, config.toml does not.
 CODEX_HOOKS_JSON = CODEX_HOME / "hooks.json"
 CODEX_CONFIG = CODEX_HOME / "config.toml"
-# Any matcher of only word characters is an exact name match rather than a
-# regex, so Codex needs no anchors to do what `^Agent$` does for Claude Code.
-CODEX_MATCHER = "spawn_agent"
+# A matcher of only word characters compiles to an exact name match rather than
+# a regex, and V2 hands the hook the namespace and the tool name run together
+# (`collaborationspawn_agent`), so the bare name -- which reads like the `^Agent$`
+# Claude Code needs -- is the one spelling that can never fire. The leading `.*`
+# makes this match whether or not the engine anchors the pattern itself.
+CODEX_MATCHER = r".*spawn_agent$"
 DESCRIPTION = "jev-router: a model picked for each spawn_agent dispatch"
 
 CODEX_TOML_SNIPPET = f"""\

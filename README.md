@@ -96,12 +96,19 @@ Hooks hot-reload — no restart, and it applies to sessions already open.
 ~/jev-router/install.py --codex     # --check to see the state, --uninstall to undo
 ```
 
-The front end is `hook_codex.py`, a `PreToolUse` hook matched on `spawn_agent`.
-Install writes `~/.codex/hooks.json` — a *sibling* of `config.toml`, not
-`hooks/hooks.json`, which is the plugin-relative path. It never writes
-`config.toml`, because TOML does not round-trip through a rewrite the way JSON
-does. The matcher needs no anchors: Codex treats a matcher of only word
-characters as an exact name match, so `spawn_agent` is enough.
+The front end is `hook_codex.py`, a `PreToolUse` hook matched on
+`.*spawn_agent$`. Install writes `~/.codex/hooks.json` — a *sibling* of
+`config.toml`, not `hooks/hooks.json`, which is the plugin-relative path. It
+never writes `config.toml`, because TOML does not round-trip through a rewrite
+the way JSON does.
+
+The matcher has to be a regex. Codex compiles a matcher of only word characters
+to an exact name match, and the V2 multi-agent backend registers the tool inside
+a namespace and hands the hook the namespace and the name run together —
+`collaborationspawn_agent`, on all 443 real spawns in the rollouts on the
+machine this was written on. A bare `spawn_agent` is therefore the one spelling
+that can never fire. Matching the tail keeps the V1 name working and survives a
+renamed namespace.
 
 Codex asks you to trust the hook the first time it loads it, and again after
 any change to the command. If you already declare `[hooks]` in `config.toml`,

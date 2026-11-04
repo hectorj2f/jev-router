@@ -60,10 +60,16 @@ def full_history_fork(ti: dict) -> bool:
 
 def main() -> None:
     ev = json.load(sys.stdin)
-    # The matcher can be `spawn_agent`, `Agent`, or a regex over either, since
-    # Codex keeps "Agent" as an alias for Claude-Code-shaped configurations.
-    # The name it hands the hook is always the first.
-    if ev.get("tool_name") != "spawn_agent":
+    # Suffix, not equality. The V2 backend registers the tool inside a
+    # namespace -- "collaboration" by default, and user-settable -- and only
+    # the default and V1 namespaces get mapped back to the bare name, so what
+    # arrives here is the namespace and the name run together. Every one of
+    # the 443 real spawns on the machine this was written on came through as
+    # `collaboration` + `spawn_agent`, which the old equality check dropped:
+    # the hook was never reached for any dispatch it exists to price. Matching
+    # on the tail keeps the bare V1 spelling working and survives a renamed
+    # namespace without hardcoding one.
+    if not str(ev.get("tool_name") or "").endswith("spawn_agent"):
         return
 
     ti = dict(ev.get("tool_input") or {})

@@ -1,9 +1,9 @@
 {
-  "description": "jev-router: score each spawn_agent dispatch with Jev and pick a model for it. Copy to ~/.codex/hooks.json, or merge the PreToolUse group into the one already there, and replace the command with the absolute path to your clone. ./install.py --codex does both for you. Declaring the same hook here and in config.toml registers it twice and routes every dispatch twice; pick one file.",
+  "description": "jev-router: score each spawn_agent dispatch with Jev and pick a model for it. Copy to ~/.codex/hooks.json, or merge the PreToolUse group into the one already there, and replace the command with the absolute path to your clone. ./install.py --codex does both for you. Declaring the same hook here and in config.toml registers it twice and routes every dispatch twice; pick one file. The matcher is a regex on purpose: a bare `spawn_agent` is compiled as an exact string, and the V2 backend hands over the namespace and the name run together (`collaborationspawn_agent`), so an exact matcher never fires.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "spawn_agent",
+        "matcher": ".*spawn_agent$",
         "hooks": [
           {
             "type": "command",

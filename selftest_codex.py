@@ -93,7 +93,13 @@ def event(**ti) -> dict:
         "model": "gpt-6.1-sol",
         "permission_mode": "default",
         "transcript_path": None,
-        "tool_name": "spawn_agent",
+        # The wire spelling, not the bare one. V2 registers the tool in a
+        # namespace and only the default and V1 namespaces are mapped back, so
+        # what a hook is handed is the two run together -- as all 443 real
+        # spawns on the machine this was written on were. The fixture said
+        # `spawn_agent` and so this suite passed, in full, against a hook that
+        # could never once have fired.
+        "tool_name": "collaborationspawn_agent",
         "tool_use_id": "call-1",
         "tool_input": ti,
     }
@@ -121,6 +127,8 @@ def main() -> int:
     # Fail-open paths: every one of these must leave the spawn untouched.
     for name, ev in [
         ("another tool is not ours", {**event(**spawn()), "tool_name": "shell"}),
+        ("a tool merely containing the name is not ours",
+         {**event(**spawn()), "tool_name": "spawn_agent_group"}),
         ("no tool_name at all", {k: v for k, v in event(**spawn()).items()
                                  if k != "tool_name"}),
         ("default fork_turns is a full-history fork",
@@ -144,6 +152,19 @@ def main() -> int:
 
     code, out = run("this is not json")
     check("malformed stdin", code == 0 and out == "", f"exit={code} out={out[:60]!r}")
+
+    # Both spellings reach the policy: the namespaced one every V2 dispatch
+    # actually arrives as, and the bare one V1 and the default namespace keep.
+    # A renamed namespace is the same shape as the first.
+    for name, tool in [("namespaced", "collaborationspawn_agent"),
+                       ("bare", "spawn_agent"),
+                       ("renamed namespace", "my_teamspawn_agent")]:
+        code, out = run({**event(**spawn(message=DEEP)), "tool_name": tool,
+                         "model": "gpt-6-luna"},
+                        plan={**PLAN, "model": "astra", "effort": "high"})
+        check(f"a {name} spawn_agent is routed",
+              code == 0 and (updated(out) or {}).get("model") == "gpt-6-astra",
+              f"tool_name={tool!r} exit={code} out={out[:60]!r}")
 
     # Off-ladder parent model: decline rather than guess. The Claude hook
     # declines on fable for the same reason; here the model arrives as a field
