@@ -134,7 +134,13 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("task", nargs="*",
                    help="task text; omit to read a JSON array on stdin")
-    p.add_argument("--default", default="sonnet", choices=policy.TIERS,
+    # The middle rung of whichever ladder is active, not a literal. `choices`
+    # became provider-dependent and argparse never validates a *default*
+    # against it -- only a value actually typed -- so a hardcoded "sonnet"
+    # sailed past the parser under codex and raised in decide() instead,
+    # taking down the whole fan-out from the one path whose own comment says
+    # a router must never be able to do that.
+    p.add_argument("--default", default=policy.TIERS[1], choices=policy.TIERS,
                    help="the model the fan-out would otherwise use")
     p.add_argument("--table", action="store_true", help="human-readable output")
     p.add_argument("--json", action="store_true", help="JSON, even for positional tasks")
