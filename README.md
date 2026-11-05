@@ -361,6 +361,75 @@ The idea is [gargpratyush/jev-router](https://github.com/gargpratyush/jev-router
 — see [Related work](#related-work). Theirs explains one decision, because a
 proxy that routes conversational turns has exactly one live at a time.
 
+### Replay a different gate over the decisions already made
+
+```bash
+./replay.py                  # the newest session
+./replay.py --all            # every session on disk
+./replay.py --sweep          # how the answer moves with the bar
+./explain.py --replay        # as an extra column beside what actually ran
+```
+
+Keeping the raw answer is only worth the bytes if something reads it back.
+`replay.py` is that reader: it recomputes each logged dispatch under a
+different downgrade gate and prints it beside the one that ran. It calls
+nothing, so a gate can be judged on traffic that already happened rather than
+on the next fortnight's.
+
+The gate it replays is the one the current policy cannot express. Today
+(**a**) collapses `depth` and `breadth` into a single weighted `need` and then
+gates the downgrade on Jev's own `confidence` field — which the
+JEV-as-a-Judge study pointedly does not use, its formula being unpublished.
+Nowhere in that is a probability of the thing being decided.
+
+(**b**) keeps the levels apart. Jev returns a probability per level, so
+`(depth, breadth)` is a distribution over 25 outcomes; push each through the
+same weights and the same two lines and it becomes a distribution over the
+three rungs. A downgrade then needs **P(this rung is enough) ≥ τ** — a
+probability of the decision itself, which is the quantity the paper's cascade
+is actually validated on.
+
+On the recorded answer the suite replays — depth `.04/.13/.68/.15/0`, breadth
+`.03/.01/.02/.79/.15`, mechanical `.88`:
+
+```
+decision                       (a) took  (b)       P cheap   P mid  P dear  why (b)
+-----------------------------------------------------------------------------------
+1  rename DueAt                sonnet    sonnet      0.182   0.795   0.022  P(<= sonnet) 0.977 >= 0.7
+```
+
+Both reach sonnet, but only one of them says 0.977.
+
+**The default τ is worth nothing.** It is a placeholder so the tool runs, not
+a finding. Choosing it needs outcome labels, and `outcome` is still null on
+every record. Use `--sweep`, which prints the disagreement count against the
+bar: a τ whose neighbours give the same answer is one the data is insensitive
+to, and a cliff is where a guessed threshold would have been doing the
+deciding.
+
+```bash
+./replay.py --tau 0.85              # one bar for every transition
+./replay.py --tau 'opus>haiku=0.95' # ... or one per transition
+```
+
+Per transition because the two are not the same bet: opus → sonnet keeps a
+capable model, opus → haiku is the one that produces a confident wrong answer.
+
+A record is skipped rather than guessed at when it cannot be replayed —
+schema 1 predates the raw answer, a front end that could not reach Jev logged
+no answer, and level probabilities that do not sum to 1 (±0.025), are missing
+a level, or carry a label the questions never had are refused rather than
+renormalised. Rungs are computed on the full ladder and only then clamped to
+what that endpoint served, so a missing tier never moves a probability.
+
+Two things it assumes, both untested: that `depth` and `breadth` are
+independent — a deep task is plausibly also broad, and a positive correlation
+would put more mass in the tails than this computes — and that `mechanical`
+can stay a point value, which is sound only because it shifts every cell
+equally rather than spreading mass.
+
+**This changes no routing.** It is the measuring instrument, not the policy.
+
 ## Verifying it works
 
 **1. The hook's logic, without Claude Code.** Drives `hook_agent.py` with
@@ -414,7 +483,7 @@ the decision and runs the hook by path, so nothing is sent anywhere:
 
 ```bash
 ./selftest_codex.py                                      # 27/27
-./selftest_route.py                                      # 20/20
+./selftest_route.py                                      # 30/30
 ```
 
 `selftest_route.py` covers the plumbing under every front end, also offline:
@@ -423,6 +492,12 @@ into one catchable error; that it asks for the pinned version; that the cache
 is keyed on that version and never stores an answer missing a field; and that
 one bad shard in a `route.py` fan-out costs that shard, not the whole run.
 Its fixture is a real `jev-1.14.0` answer rather than an invented one.
+
+The `replay.py` cases hold that fixture to arithmetic done by hand — the 25
+cells of the outer product summing to `.1822/.7953/.0225` — so that moving a
+weight or a line fails the suite rather than silently moving the counterfactual
+too. The rest are the refusals: levels that do not sum, a missing level, a
+label the questions never had, and a rung the endpoint does not serve.
 
 Most of it is the shapes that must *not* route: both fork spellings and all
 four ways `fork_turns` can mean "all", a V1 `fork_context` call, a parent on a
@@ -744,6 +819,7 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
 | `decisions.py` | the append-only decision log, one JSONL file per session. Written by both front ends, including the decisions that changed nothing |
 | `explain.py` | reads the log back: the session as a table, then everything behind any one row |
+| `replay.py` | recomputes logged dispatches under a different downgrade gate, offline. Measures; routes nothing |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the Claude hook with synthetic events; asserts routing and every fail-open path |
 | `selftest_codex.py` | the same for `hook_codex.py`, with the decision pinned so it needs no key |

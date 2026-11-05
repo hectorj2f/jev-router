@@ -176,6 +176,22 @@ def available_tiers(provider: types.ModuleType | None = None) -> list[str]:
     return out
 
 
+def need_of(depth: float, breadth: float, mechanical: float) -> float:
+    """How much model the work wants, from three signals already in [0, 1].
+
+    A function rather than a line inside decide() because replay.py evaluates
+    it once per (depth, breadth) level pair to get a distribution over rungs.
+    Two copies of these weights would be two policies the moment either moved.
+    """
+    return 0.60 * depth + 0.40 * breadth - 0.25 * mechanical
+
+
+def rung_of(need: float, tiers: list[str]) -> str:
+    """Which rung a `need` falls in. The two lines, in one place."""
+    cheap, mid, dear = tiers
+    return dear if need >= OPUS_LINE else mid if need >= SONNET_LINE else cheap
+
+
 def nearest_tier(tier: str, avail: list[str], ladder: list[str] | None = None) -> str:
     """`tier` if it is served, else the next one up. Never silently cheaper."""
     ladder = ladder if ladder is not None else TIERS
@@ -296,9 +312,9 @@ def decide(ans: dict, default: str | None = None, tiers: list[str] | None = None
     # near-constant +0.20 against a 0.25 haiku line. That reading is not wrong --
     # a conversational prompt genuinely is under-specified -- it is just the
     # wrong response to it. See `advice` below.
-    need = 0.60 * depth + 0.40 * breadth - 0.25 * mechanical
+    need = need_of(depth, breadth, mechanical)
 
-    wanted = dear if need >= OPUS_LINE else mid if need >= SONNET_LINE else cheap
+    wanted = rung_of(need, prov.TIERS)
     suggested = nearest_tier(wanted, avail, prov.TIERS)
 
     # An upgrade is ungated: if `need` clears the bar, take it, even when Jev is

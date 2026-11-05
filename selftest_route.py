@@ -31,6 +31,7 @@ os.environ.setdefault("TYPESAFE_API_KEY", "selftest-not-a-key")
 import decisions  # noqa: E402
 import jev  # noqa: E402
 import policy  # noqa: E402
+import replay  # noqa: E402
 import route  # noqa: E402
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -266,6 +267,84 @@ def main() -> int:
     check("explain: a log mixing schema 1 and 2 still replays",
           shown.returncode == 0 and "pre-schema" in shown.stdout,
           (shown.stderr or shown.stdout)[-120:])
+
+    # --- replay.py: the summed gate, over a record carrying a real answer ----
+    # Built from `plan` rather than from the fan-out's records: those went
+    # through a stub that returns no `jev`, which is itself one of the cases
+    # below. This is the shape decisions.record writes.
+    full = {"schema": decisions.SCHEMA, "at": 2.0, "label": "rename DueAt",
+            "dispatch": "toolu_r", "provider": "claude", "default": "opus",
+            "task": TASK, "task_len": len(TASK), "outcome": None, **plan}
+
+    # Hand-computed from REAL, which is why the fixture is a real answer:
+    # need(i,j) = 0.15i + 0.10j - 0.22 against the 0.25 and 0.60 lines, summed
+    # over the outer product of depth .04/.13/.68/.15/0 and breadth
+    # .03/.01/.02/.79/.15. If the weights or the lines move, these move with
+    # them and the case is meant to fail.
+    probs = replay.rung_probs(full["jev"]["answers"], ["haiku", "sonnet", "opus"])
+    check("replay: the rung distribution is the outer product of the levels",
+          probs is not None and all(abs(probs[t] - want) < 5e-4 for t, want in
+                                    (("haiku", .1822), ("sonnet", .7953), ("opus", .0225))),
+          f"{probs}")
+
+    at = lambda tau, r=full: replay.replay_one(r, {"*": tau}, replay.UP_BAR)  # noqa: E731
+    check("replay: a bar the mass clears downgrades, agreeing with the gate that ran",
+          at(0.70)["model"] == full["model"] == "sonnet", f"{at(0.70)}")
+    check("replay: a bar it does not clear holds at the parent, and says by how much",
+          at(0.99)["model"] == "opus" and "0.977 < 0.99" in at(0.99)["why"],
+          f"{at(0.99)}")
+    # The cheapest rung that clears, not one step at a time: at a bar below
+    # P(haiku) the same answer should skip sonnet entirely.
+    check("replay: a very low bar takes the cheapest rung that clears, not the next one",
+          at(0.15)["model"] == "haiku", f"{at(0.15)}")
+    # ... but never past what the endpoint served. The probabilities are
+    # computed on the full ladder either way, so the clamp must not move them.
+    unserved = {**full, "tiers": ["sonnet", "opus"]}
+    got = replay.replay_one(unserved, {"*": 0.15}, replay.UP_BAR)
+    check("replay: a rung the endpoint does not serve is clamped up, not emitted",
+          got["model"] == "sonnet" and abs(got["probs"]["haiku"] - .1822) < 5e-4,
+          f"{got}")
+
+    for name, broken in [
+        ("levels that do not sum to 1", {"0": 0.1, "1": 0.1, "2": 0.1, "3": 0.1, "4": 0.1}),
+        ("a level that is not there", {"0": 0.2, "1": 0.3, "2": 0.5}),
+        ("a label the questions do not have", {"0": .04, "1": .13, "2": .68,
+                                               "3": .15, "4": 0.0, "5": 0.0}),
+    ]:
+        bad = copy.deepcopy(full)
+        bad["jev"]["answers"]["depth"]["probabilities"] = broken
+        out = replay.replay_one(bad, {"*": 0.70}, replay.UP_BAR)
+        check(f"replay: {name} is skipped, not renormalised into a decision",
+              "skip" in out and "model" not in out, f"{out}")
+
+    # A record written under the other provider replays on that ladder, not on
+    # this process's. One log holds both.
+    codex_rec = {**copy.deepcopy(full), "provider": "codex", "default": "astra",
+                 "model": "sol", "tiers": ["luna", "sol", "astra"]}
+    got = replay.replay_one(codex_rec, {"*": 0.70}, replay.UP_BAR)
+    check("replay: a codex record replays on the codex ladder",
+          got.get("model") == "sol" and got.get("tiers") == ["luna", "sol", "astra"],
+          f"{got}")
+
+    with open(decisions.path_for("replayed"), "w") as f:
+        f.write(json.dumps(old) + "\n" + json.dumps(full) + "\n")
+    shown = subprocess.run([sys.executable, str(HERE / "explain.py"),
+                            "--session", "replayed", "--replay"],
+                           capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "JEV_DECISIONS_DIR": str(decisions.LOG_DIR)})
+    # The numbered rows only: the tally line below the table also starts with
+    # a digit.
+    lines = {ln.split("  ")[1].strip(): ln for ln in shown.stdout.splitlines()
+             if ln.startswith(("1  ", "2  "))}
+    check("explain --replay: the extra column covers schema 2 and blanks schema 1",
+          shown.returncode == 0 and "(b)" in shown.stdout
+          # The gate's own column, not the model column: at this tau (b)
+          # agrees, so the row says sonnet twice and the schema 1 row once.
+          and lines.get("rename DueAt", "").count("sonnet") == 2
+          # Its own row routed and has a model; the only `--` on it is the
+          # replay column declining a record that kept no answer.
+          and lines.get("pre-schema", "").count("--") == 1,
+          (shown.stderr or json.dumps(lines))[-200:])
 
     # --- the default tier follows the provider -------------------------------
     helped = subprocess.run([sys.executable, str(HERE / "route.py"), "--help"],
