@@ -44,23 +44,26 @@ def main() -> None:
     state = (f"Agent type: {agent}\n"
              f"Description: {ti.get('description') or ''}\n"
              f"Task:\n{ti.get('prompt') or ''}")
+    session = ev.get("session_id") or pathlib.Path(
+        ev.get("transcript_path") or "").stem
+    label = ti.get("description") or agent
     try:
         plan = policy.route(state[:STATE_LIMIT], default=default)
-    except SystemExit as e:
-        # jev.py exits rather than raises on a missing key or a dead API, and
-        # SystemExit is not an Exception, so this used to leave the hook's one
-        # logged path -- the record below -- unreached. A Jev outage looked
-        # exactly like a router that never fired, which is the ambiguity the
-        # log exists to remove. route.py:route_one does the same thing.
+    except (Exception, SystemExit) as e:
+        # Both, and they arrive for different reasons: jev.py reports a missing
+        # key or a dead API as SystemExit, which is not an Exception, while a
+        # malformed answer raises KeyError inside decide(). Either way the
+        # dispatch is left alone, which is indistinguishable from a hold until
+        # the log says otherwise -- so fall through to the one record() below
+        # rather than logging here, and keep the failure on the same path as
+        # the decision. route.py:route_one does the same.
         plan = {"model": default, "effort": policy.EFFORT[default],
-                "why": f"jev error: {e}"}
+                "why": f"jev error: {decisions.why_of(e)}"}
 
     # Before the early return, not after: a decision that changed nothing is
     # still a decision, and it is the one /jev-explain exists to show.
-    session = ev.get("session_id") or pathlib.Path(
-        ev.get("transcript_path") or "").stem
-    decisions.record(session, ti.get("description") or agent, default, plan,
-                     state)
+    decisions.record(session, label, default, plan,
+                     state, dispatch=ev.get("tool_use_id"))
 
     if plan["model"] == default:
         return
@@ -80,5 +83,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except (Exception, SystemExit):
+        # SystemExit too: it is how jev.py reports a missing key, an HTTP error
+        # or a network failure, and an uncaught one exits 1 with a message on
+        # stderr rather than the silent 0 this hook promises.
         sys.exit(0)

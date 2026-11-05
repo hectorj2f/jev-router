@@ -82,6 +82,9 @@ def main() -> None:
     p.add_argument("--last", action="store_true",
                    help="everything behind the most recent decision")
     p.add_argument("--json", action="store_true", help="the records themselves")
+    p.add_argument("--replay", action="store_true",
+                   help="a column for what the summed gate would have chosen "
+                        "(replay.py; `*` marks a disagreement)")
     args = p.parse_args()
 
     known = decisions.sessions()
@@ -90,6 +93,15 @@ def main() -> None:
               "subagent dispatch, so this fills up on its own; by hand, pass\n"
               "./route.py a --session to write under.")
         return
+
+    # --replay only has a column to add to the table view. Silently dropping it
+    # on the other four leaves you reading an ordinary view believing it is a
+    # counterfactual one; ./replay.py --json is the answer for the JSON case.
+    if args.replay and (args.sessions or args.json or args.last
+                        or args.index is not None):
+        sys.exit("--replay adds a column to the table view; it has nowhere to "
+                 "go on --sessions, --json, --last or a single decision.\n"
+                 "For JSON, ./replay.py --json prints the gate's own output.")
 
     if args.sessions:
         list_sessions(known, args.json)
@@ -122,8 +134,22 @@ def main() -> None:
     span = (ago(recs[0]["at"]) if len(recs) == 1
             else f"{ago(recs[0]['at'])} to {ago(recs[-1]['at'])}")
     print(f"session {session}: {len(recs)} decisions, {span}\n")
-    route.table([{**r, "id": f"{i}  {r['label']}"}
-                 for i, r in enumerate(recs, 1)], column="decision")
+    rows = [{**r, "id": f"{i}  {r['label']}"} for i, r in enumerate(recs, 1)]
+
+    extra = None
+    if args.replay:
+        # Imported here rather than at the top: this is the only path that
+        # needs it, and explain.py is what the `/jev-explain` command runs.
+        import replay  # noqa: PLC0415
+        extra = ("(b)", {row["id"]: replay.cell(r)
+                         for row, r in zip(rows, replay.rows(
+                             recs, {"*": replay.TAU}, replay.UP_BAR))})
+
+    route.table(rows, column="decision", extra=extra)
+    if args.replay:
+        print(f"\n(b): the summed gate at an unmeasured tau of {replay.TAU}, "
+              f"`*` where it disagrees.\n     ./replay.py --sweep for how that "
+              f"moves with tau.")
     print("\n./explain.py <n> for everything behind one of them")
 
 

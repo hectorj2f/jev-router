@@ -42,7 +42,11 @@ os.environ["JEV_PROVIDER"] = "codex"
 import policy
 from providers import codex
 plan = json.loads(os.environ["JEV_FAKE_PLAN"])
-policy.route = lambda state, default=None, cache=True: plan
+def fake_route(state, default=None, cache=True):
+    if os.environ.get("JEV_FAKE_FAIL"):
+        raise SystemExit(os.environ["JEV_FAKE_FAIL"])
+    return plan
+policy.route = fake_route
 codex.EFFORT.update(json.loads(os.environ.get("JEV_FAKE_EFFORT") or "{}"))
 runpy.run_path(os.environ["JEV_HOOK"], run_name="__main__")
 '''
@@ -262,6 +266,20 @@ def main() -> int:
           len(logged) == 1 and logged[0]["task"].startswith("Agent type: reviewer")
           and logged[0]["label"] == "gofmt_release_load",
           f"logged {logged!r:.80}")
+
+    # Jev unreachable: jev.py reports that as SystemExit, which the hook used
+    # to let escape as exit 1. It must leave the spawn alone, silently, and
+    # still say in the log that it tried.
+    code, out = run({**event(**spawn()), "session_id": "sess-down",
+                     "model": "gpt-6-astra"},
+                    env={"JEV_FAKE_FAIL": "jev: unreachable: connection refused"})
+    logged = decisions.read("sess-down")
+    check("an unreachable Jev exits 0, untouched, and is logged",
+          code == 0 and out == "" and len(logged) == 1
+          and logged[0]["model"] == "astra"
+          and "unreachable" in logged[0].get("why", "")
+          and logged[0].get("dispatch") == "call-1",
+          f"exit={code} out={out[:40]!r} logged {logged!r:.100}")
 
     # A spawn the hook declines must not leave a decision behind either: there
     # was no decision to make.

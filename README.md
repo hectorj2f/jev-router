@@ -274,9 +274,10 @@ design-epoch                 opus     0.86  0.71  clarify
 2xhaiku, 3xsonnet, 5xopus
 ```
 
-Five of ten held at opus, every one of them for weak evidence — `tf-apply` at
-confidence 0.00, `binding-guard` at 0.06. That is the asymmetry working, not the
-router failing.
+Five of ten on opus, but only four of those are holds — and every hold is
+there for weak evidence, `tf-apply` at confidence 0.00, `binding-guard` at
+0.06. The fifth, `design-epoch`, cleared the opus line outright at `need` 0.86.
+That is the asymmetry working, not the router failing.
 
 Jev is non-deterministic: identical input drifts by a few hundredths of a point
 between runs, so your numbers will differ slightly from these. Tier assignments
@@ -294,9 +295,10 @@ Piped without `--table` it emits JSON suitable as `args` to
 
 A routing decision is invisible by construction. It is made before the agent
 starts, the only trace it leaves is a model id on a transcript nobody opens,
-and by the time the work comes back wrong the reasoning is gone. Worse, both
-front ends return early when the decision matches the tier already in use — so
-a hold doing its job has always looked exactly like the router not running.
+and by the time the work comes back wrong the reasoning is gone. Worse, all
+three front ends return early when the decision matches the tier already in
+use — so a hold doing its job has always looked exactly like the router not
+running.
 
 Every decision is now appended to `cache/decisions/<session>.jsonl`, including
 the ones that changed nothing, and `explain.py` reads them back:
@@ -341,9 +343,99 @@ and isn't recorded. It is pruned at seven days, task text is cut at 4,000
 characters with the original length kept alongside, and `cache/` is
 gitignored. `JEV_DECISIONS_DIR` moves it.
 
+Each record (schema 2) also carries what a threshold will one day be fitted
+on, rather than only what was concluded:
+
+- `jev` — the raw answer: every level probability of `depth` and `breadth`,
+  the three nouls, the version Jev says answered, the version requested, and a
+  hash of the question set. A different gate can then be replayed over past
+  dispatches instead of judged on new traffic alone.
+- `dispatch` — the host's `tool_use_id` for the spawn, so an outcome found
+  later joins back by id rather than by a label that repeats.
+- `outcome` — `null` at decision time, because nothing then can know whether
+  the work was good enough. It is the field calibration needs, and nothing
+  fills it yet.
+- `provider`, and `why` on any decision Jev could not make — a failure is
+  logged by all three front ends, so "could not reach Jev" and "ran and held"
+  no longer look the same.
+
 The idea is [gargpratyush/jev-router](https://github.com/gargpratyush/jev-router)'s
 — see [Related work](#related-work). Theirs explains one decision, because a
 proxy that routes conversational turns has exactly one live at a time.
+
+### Replay a different gate over the decisions already made
+
+```bash
+./replay.py                  # the newest session
+./replay.py --all            # every session on disk
+./replay.py --sweep          # how the answer moves with the bar
+./explain.py --replay        # as an extra column beside what actually ran
+```
+
+Keeping the raw answer is only worth the bytes if something reads it back.
+`replay.py` is that reader: it recomputes each logged dispatch under a
+different downgrade gate and prints it beside the one that ran. It calls
+nothing, so a gate can be judged on traffic that already happened rather than
+on the next fortnight's.
+
+The gate it replays is the one the current policy cannot express. Today
+(**a**) collapses `depth` and `breadth` into a single weighted `need` and then
+gates the downgrade on Jev's own `confidence` field — which the
+JEV-as-a-Judge study pointedly does not use, its formula being unpublished.
+Nowhere in that is a probability of the thing being decided.
+
+(**b**) keeps the levels apart. Jev returns a probability per level, so
+`(depth, breadth)` is a distribution over 25 outcomes; push each through the
+same weights and the same two lines and it becomes a distribution over the
+three rungs. A downgrade then needs **P(this rung is enough) ≥ τ** — a
+probability of the decision itself, which is the quantity the paper's cascade
+is actually validated on.
+
+On the recorded answer the suite replays — depth `.04/.13/.68/.15/0`, breadth
+`.03/.01/.02/.79/.15`, mechanical `.88`:
+
+```
+decision                       (a) took  (b)       P cheap   P mid  P dear  why (b)
+-----------------------------------------------------------------------------------
+1  rename DueAt                sonnet    sonnet      0.182   0.795   0.022  P(<= sonnet) 0.977 >= 0.7
+```
+
+Both reach sonnet, but only one of them says 0.977.
+
+**The default τ is worth nothing.** It is a placeholder so the tool runs, not
+a finding. Choosing it needs outcome labels, and `outcome` is still null on
+every record. Use `--sweep`, which prints the disagreement count against the
+bar: a τ whose neighbours give the same answer is one the data is insensitive
+to, and a cliff is where a guessed threshold would have been doing the
+deciding.
+
+```bash
+./replay.py --tau 0.85              # one bar for every transition
+./replay.py --tau 'opus>haiku=0.95' # ... or one per transition
+```
+
+Per transition because the two are not the same bet: opus → sonnet keeps a
+capable model, opus → haiku is the one that produces a confident wrong answer.
+
+A record is skipped rather than guessed at when it cannot be replayed —
+schema 1 predates the raw answer, a front end that could not reach Jev logged
+no answer, and level probabilities that do not sum to 1 (±0.025), are missing
+a level, or carry a label the questions never had are refused rather than
+renormalised. Rungs are computed on the full ladder and only then clamped to
+what that endpoint served, so a missing tier never moves a probability.
+
+Two things it assumes, both untested. That `depth` and `breadth` are
+independent — a deep task is plausibly also broad, and a positive correlation
+would put more mass in the tails than this computes. And that `mechanical` can
+stay a point value: a noul has a distribution too, and collapsing it to its
+mean makes every rung probability here a conditional one, computed as though
+`mechanical` were known exactly. Because it enters `need` as a constant it
+shifts all 25 cells by the same amount, so it cannot reorder them — but a
+sharp P(≤ sonnet) sitting just over τ may be sharp only because the spread in
+one of its three inputs was dropped. Which direction that moves a real
+decision is unmeasured.
+
+**This changes no routing.** It is the measuring instrument, not the policy.
 
 ## Verifying it works
 
@@ -377,8 +469,10 @@ PASS  a torn line costs one record, not the log
 PASS  a session id cannot escape the log dir
 PASS  no session id, no log
 PASS  a decision that changed nothing is still logged
+PASS  a jev outage is logged, not swallowed
+PASS  a stale log survives a concurrent prune
 
-21/21 passed
+23/23 passed
 ```
 
 The routing cases pin `JEV_TIERS` so they test the policy rather than your
@@ -395,8 +489,31 @@ The Codex hook has its own suite, which needs no key at all — every case pins
 the decision and runs the hook by path, so nothing is sent anywhere:
 
 ```bash
-./selftest_codex.py                                      # 22/22
+./selftest_codex.py                                      # 27/27
+./selftest_route.py                                      # 61/61
 ```
+
+`selftest_route.py` covers the plumbing under every front end, also offline:
+that the Jev client turns a refused connection, a timeout or a non-JSON body
+into one catchable error; that it asks for the pinned version; that the cache
+is keyed on that version and never stores an answer missing a field; and that
+one bad shard in a `route.py` fan-out costs that shard, not the whole run.
+Its fixture is a real `jev-1.14.0` answer rather than an invented one.
+
+The `replay.py` cases hold that fixture to arithmetic done by hand — the 25
+cells of the outer product summing to `.1822/.7953/.0225` — so that moving a
+weight or a line fails the suite rather than silently moving the counterfactual
+too. Checked by mutation, not by assertion: each of the three weights and both
+tier lines was moved in turn, and every one of the five reddens the suite.
+
+The rest are the refusals, and they are most of the file: levels that do not
+sum, a missing level, a label the questions never had, a level that is NaN,
+negative, or a number sent as a string, an answer that is a list or a string
+rather than an object, an answer scored under a question set that has since
+been reworded, a rung the endpoint does not serve, and every malformed
+`--tau` — a bar outside (0, 1], a tier name that is not on either ladder, and
+a pair naming an upgrade or the same tier twice. A gate that silently ignored
+a bar you typed would be worse than one that refused it.
 
 Most of it is the shapes that must *not* route: both fork spellings and all
 four ways `fork_turns` can mean "all", a V1 `fork_context` call, a parent on a
@@ -668,8 +785,19 @@ that fires on nearly everything is noise. It needs a threshold measured on
 
 ~$0.00003 per task routed ($0.042/Mtok input, output free). A 50-shard fan-out
 is about a tenth of a cent. Answers are memoized for 7 days in `cache/`, keyed
-on the task text *and* the question set — the latter matters, since keying on
-the text alone silently serves answers to questions you've since edited.
+on the task text, the question set *and* the Jev version requested — keying on
+the text alone silently serves answers to questions you've since edited, or
+from a scorer you've since moved off.
+
+**The Jev version is pinned**, to `jev-1.14.0`, rather than `jev-latest`. The
+thresholds were tuned against one version of the scorer, and "latest" moves
+under them without saying so: the JEV-as-a-Judge study
+([arXiv 2609.26550](https://arxiv.org/abs/2609.26550)) ran on 1.13.0 and saw 7
+of 350 decisions change between two of its own collection rounds, and by
+November the API was answering as 1.14.0. Moving is a decision:
+`export JEV_MODEL=jev-1.15.0` (or `jev-latest`, knowingly). If the pinned
+version is ever retired the router stops routing, fails open, and says why in
+the decision log.
 
 **Every routed task is POSTed to `api.typesafe.ai`**, carrying task text, file
 paths, and whatever else is in the prompt. That is a real disclosure decision,
@@ -705,11 +833,13 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `install.py` | registers/removes the hook in `~/.claude/settings.json`, or in `~/.codex/hooks.json` with `--codex`. Backs up before every write |
 | `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
-| `decisions.py` | the append-only decision log, one JSONL file per session. Written by both front ends, including the decisions that changed nothing |
+| `decisions.py` | the append-only decision log, one JSONL file per session. Written by all three front ends, including the decisions that changed nothing |
 | `explain.py` | reads the log back: the session as a table, then everything behind any one row |
+| `replay.py` | recomputes logged dispatches under a different downgrade gate, offline. Measures; routes nothing |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the Claude hook with synthetic events; asserts routing and every fail-open path |
 | `selftest_codex.py` | the same for `hook_codex.py`, with the decision pinned so it needs no key |
+| `selftest_route.py` | the Jev client, the cache, the fan-out and the decision log, offline, against a real recorded answer |
 | `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. Never yet run |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `verify_codex.py` | the same against Codex rollouts, joined to the decision log by `task_name`, one verdict per dispatch |
@@ -728,14 +858,15 @@ it after writing this one.
 |---|---|---|
 | mechanism | loopback proxy on `ANTHROPIC_BASE_URL`, with a sentinel model in `/model` | a mod on `agent.spawn`, or a `PreToolUse` hook |
 | scope | every fresh user turn | subagent dispatches only |
-| CLIs | Claude Code and OpenAI Codex | Claude Code |
+| CLIs | Claude Code and OpenAI Codex | Claude Code and OpenAI Codex |
 | the decision | Jev picks the tier; code adjusts it | Jev answers five atomic questions; code combines them |
 | version floor | none — it sits below the CLI | 2.1.287 for the mod, none for the hook |
 | published measurements | none | [Findings](#findings) |
 
-Use theirs if you want this working today across both CLIs and every turn.
-The reason this repo exists is the last row, and the reason it routes nothing
-but dispatches is the row above it: scoring a conversational turn is the thing
+Use theirs if you want this working today on every turn, and on every CLI
+version rather than above a floor. The reason this repo exists is the
+*published measurements* row, and the reason it routes nothing but dispatches
+is the *scope* row: scoring a conversational turn is the thing
 [Findings](#findings) says does not work, measured over 26 real prompts.
 
 Two places the difference is load-bearing rather than cosmetic:
