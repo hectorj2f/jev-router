@@ -61,6 +61,15 @@ function decision(over: Record<string, unknown> = {}) {
     held: false,
     wanted: 'sonnet',
     tiers: ['haiku', 'sonnet', 'opus'],
+    // Both are on every successful decision route.py prints, and the mod reads
+    // them: `advice.confirm` is what raises the irreversible warning, and
+    // `signals.irreversible` is the number it quotes. A fixture without them
+    // is a shape route.py never emits.
+    advice: { confirm: false, clarify: false },
+    signals: {
+      depth: 1.94, breadth: 3.02, mechanical: 0.88,
+      irreversible: 0.09, ambiguous: 0.66,
+    },
     ...over,
   }])
 }
@@ -154,6 +163,27 @@ test('a hold is reported, not routed', async ($, on) => {
   await $.agent.spawn(dispatch())
 
   expect(spawned).toEqual([PARENT])
+})
+
+test('an irreversible dispatch is warned about, not re-tiered', async ($, on) => {
+  // The warning is a line, and the line is all it is. A cheap model posting
+  // the right comment is fine; what the irreversibility asks for is a
+  // confirmation step, and buying a bigger model answers none of it. On a
+  // measured run an old `irreversible` floor sent "reformat this comment I
+  // already wrote" straight to opus on this basis alone.
+  const { spawned } = stub(on, {
+    stdout: decision({
+      advice: { confirm: true, clarify: false },
+      signals: { depth: 1.2, breadth: 0.8, mechanical: 0.9,
+        irreversible: 0.94, ambiguous: 0.3 },
+    }),
+  })
+
+  await $.agent.spawn(dispatch())
+
+  // sonnet because the score earned it, not because of the advice: the
+  // fixture's own model field is unchanged by the warning.
+  expect(spawned).toEqual(['sonnet'])
 })
 
 test('a fork is never priced', async ($, on) => {

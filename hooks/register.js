@@ -88,6 +88,36 @@ function decisionLine(plan, parent, label) {
   return null
 }
 
+/**
+ * The warning a dispatch that writes outside the tree is worth, or null.
+ *
+ * Separate from decisionLine because it is not about the tier, and printed
+ * even when that returns null: a dispatch the router agreed with is exactly
+ * the case where nothing is said today, and "deploy this" agreeing with opus
+ * is still a deploy.
+ *
+ * A line rather than a gate. The finding `irreversible` comes from says the
+ * response to it is a confirmation step, which needs `tool.check` to know
+ * which dispatch a tool call belongs to and whether it writes -- neither
+ * `agentId` nor `isReadOnly` is in the declarations that shipped, so built
+ * today it would prompt on every tool call in the session. Saying so at spawn
+ * costs nothing and needs nothing. It does NOT move the tier: a cheap model
+ * posting the right comment is fine, and buying a bigger one answers none of
+ * what the irreversibility is asking for.
+ *
+ * `clarify` is deliberately not here. Measured over 26 real prompts
+ * `ambiguous` reads a median of 0.80, so a warning on it fires on nearly
+ * everything; it needs a threshold measured on dispatch prompts first.
+ */
+function adviceLine(plan, label) {
+  if (!plan.advice?.confirm) return null
+  // policy.decide owns the threshold; this only reports what it concluded.
+  const score = plan.signals?.irreversible
+  const at = typeof score === 'number' ? ` ${score.toFixed(2)}` : ''
+  return `${label} -- irreversible${at}: writes outside the working tree. ` +
+    `Tier unchanged; this is a warning, not a gate.`
+}
+
 export function register(on) {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -150,8 +180,10 @@ export function register(on) {
     }
     if (!plan) return next(e)
 
-    const line = decisionLine(plan, parent, label)
-    if (line) $.ui.log(line)
+    for (const line of [decisionLine(plan, parent, label),
+      adviceLine(plan, label)]) {
+      if (line) $.ui.log(line)
+    }
     // Never a deny: a refusal surfaces to the parent as an Agent tool error,
     // and a router has no business failing a dispatch it was only asked to
     // price. An unroutable task runs on the model it was already going to use.

@@ -735,26 +735,45 @@ false-cheap, the first thing to check is the prompt, and the next lever is
 raising the confidence floor from 0.70. Do not reach for another signal; that
 was tried and measured as contributing nothing.
 
-## The advice half, still unbuilt
+## The advice half, mostly unbuilt
 
-`decide()` returns `advice.confirm` and `advice.clarify`, and nothing has ever
-acted on them. They print. That was defensible when the only front end was a
-`PreToolUse` hook, whose entire vocabulary is a model name — but the finding
-they come from says the response to irreversibility is a confirmation step and
-the response to ambiguity is a question back, and the router currently delivers
-neither. Two sketches, both deliberately not in this PR:
+`decide()` returns `advice.confirm` and `advice.clarify`. The finding they come
+from says the response to irreversibility is a confirmation step and the
+response to ambiguity is a question back, and for a long time the router
+delivered neither — they printed in `./route.py` output nobody was reading at
+dispatch time.
 
-**`confirm` should raise the confirmation posture, not print.** A mod sees
-`tool.check` and can turn one into a prompt, so the shape is obvious: a
-dispatch that scored `irreversible > 0.60` gets its writes confirmed, the rest
-of the session doesn't. The blocker is identity and read/write. `ToolCheckInput`
-in the published declarations is `{tool, input, tool_use_id?}` — no `agentId`,
-so you cannot tell which dispatch a tool call came from, and no `isReadOnly`,
-so you cannot tell a read from a write. The documentation says both exist
-(`agentId` from v2.1.290, `isReadOnly` from v2.1.304); the declarations shipped
-alongside it have neither. Built against what is actually declared, this
-prompts on every tool call in the session, which nobody would keep installed
-for a week. Check the declarations before writing it, not the docs.
+**`confirm` now says so at spawn, in the mod.** A dispatch scoring
+`irreversible > 0.60` gets a line of its own:
+
+```
+deploy the staging bump -- irreversible 0.94: writes outside the working tree.
+Tier unchanged; this is a warning, not a gate.
+```
+
+Printed even when the tier decision itself was worth no line, because a
+dispatch the router agreed with is exactly the case where nothing was said
+before, and "deploy this" agreeing with opus is still a deploy. It does **not**
+move the tier: a cheap model posting the right comment is fine, and on a
+measured run an old `irreversible` floor sent "reformat this comment I already
+wrote" straight to opus on that basis alone.
+
+**Raising the confirmation posture is still blocked.** A mod sees `tool.check`
+and could turn one into a prompt, so the shape is obvious: a dispatch that
+scored `irreversible > 0.60` gets its writes confirmed, the rest of the session
+doesn't. The blocker is identity and read/write. `ToolCheckInput` in the
+published declarations is `{tool, input, tool_use_id?}` — no `agentId`, so you
+cannot tell which dispatch a tool call came from, and no `isReadOnly`, so you
+cannot tell a read from a write. The documentation says both exist (`agentId`
+from v2.1.290, `isReadOnly` from v2.1.304); the declarations shipped alongside
+it have neither. Built against what is actually declared, this prompts on every
+tool call in the session, which nobody would keep installed for a week. Check
+the declarations before writing it, not the docs.
+
+The Codex hook deliberately gets none of this. Attaching a message there means
+emitting `hookSpecificOutput`, and Codex discards any output without
+`permissionDecision: "allow"` — so the only way to warn about an irreversible
+spawn would be to pre-approve it. That trade is the wrong way round.
 
 **`clarify` should reach the parent before the dispatch does.** A task reading
 `ambiguous > 0.70` is one the subagent will guess at, and the parent is the
