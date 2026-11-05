@@ -68,7 +68,7 @@ async function routeOne($, state, parent, label, session, dispatch) {
 }
 
 /** The one line the decision is worth, or null when nothing was decided. */
-function decisionLine(plan, parent, label) {
+export function decisionLine(plan, parent, label) {
   // A Jev error reaches us as a routed shard on the default tier. Worth saying
   // out loud: otherwise a broken router and a quiet one look identical.
   if (plan.why) return `${label} -- not routed: ${plan.why}`
@@ -86,6 +86,48 @@ function decisionLine(plan, parent, label) {
       `a downgrade needs mechanical > 0.75 or conf >= 0.70 (${numbers})`
   }
   return null
+}
+
+/**
+ * The warning a dispatch that writes outside the tree is worth, or null.
+ *
+ * Exported, with decisionLine, so the tests can assert the text itself. Via
+ * `agent.spawn` alone the only observable is which model the dispatch ran on,
+ * which is by design the one thing these lines do not change -- so a test
+ * driven through the hook passes just as well when they return null.
+ *
+ * Separate from decisionLine because it is not about the tier, and printed
+ * even when that returns null: a dispatch the router agreed with is exactly
+ * the case where nothing is said today, and "deploy this" agreeing with opus
+ * is still a deploy.
+ *
+ * A line rather than a gate. The finding `irreversible` comes from says the
+ * response to it is a confirmation step, which needs `tool.check` to know
+ * which dispatch a tool call belongs to and whether it writes -- neither
+ * `agentId` nor `isReadOnly` is in the declarations that shipped, so built
+ * today it would prompt on every tool call in the session. Saying so at spawn
+ * costs nothing and needs nothing. It does NOT move the tier: a cheap model
+ * posting the right comment is fine, and buying a bigger one answers none of
+ * what the irreversibility is asking for.
+ *
+ * `clarify` is deliberately not here: `ambiguous` reads high on nearly
+ * everything (see the Findings section of the README), so a warning on it
+ * fires on nearly everything. It needs a threshold measured on dispatch
+ * prompts first.
+ *
+ * `alone` is whether this is the only line printed. The trailing clause says
+ * the warning did not move the tier, which contradicts itself when
+ * decisionLine has just announced a re-tier directly above -- and that is the
+ * common case, not a corner one: an irreversible dispatch usually scores high
+ * on `mechanical`, which is what earns the downgrade in the first place.
+ */
+export function adviceLine(plan, label, alone) {
+  if (!plan.advice?.confirm) return null
+  // policy.decide owns the threshold; this only reports what it concluded.
+  const score = plan.signals?.irreversible
+  const at = typeof score === 'number' ? ` ${score.toFixed(2)}` : ''
+  const not = alone ? ' Tier unchanged; this is a warning, not a gate.' : ''
+  return `${label} -- irreversible${at}: writes outside the working tree.${not}`
 }
 
 export function register(on) {
@@ -134,8 +176,10 @@ export function register(on) {
     // No .catch handler on this registration, deliberately. A hook that fails
     // before calling next is skipped and the spawn proceeds on the model it
     // would otherwise have used, which is already the behaviour we want; a
-    // handler would add a concept and change nothing. The try is here because
-    // a throw after a decision is made should also leave the dispatch alone.
+    // handler would add a concept and change nothing. The try covers the call
+    // to Jev; the two line builders below are outside it because neither can
+    // throw on a plan route.py emits -- decisionLine returns at `plan.why`
+    // before touching a number, and adviceLine is guarded by `advice?.confirm`.
     //
     // This is fail-open over our own code paths only. What protects the
     // dispatch from a tier the endpoint cannot serve is the ladder clamp in
@@ -150,8 +194,10 @@ export function register(on) {
     }
     if (!plan) return next(e)
 
-    const line = decisionLine(plan, parent, label)
-    if (line) $.ui.log(line)
+    const decided = decisionLine(plan, parent, label)
+    for (const line of [decided, adviceLine(plan, label, !decided)]) {
+      if (line) $.ui.log(line)
+    }
     // Never a deny: a refusal surfaces to the parent as an Agent tool error,
     // and a router has no business failing a dispatch it was only asked to
     // price. An unroutable task runs on the model it was already going to use.

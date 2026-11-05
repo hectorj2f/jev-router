@@ -147,6 +147,7 @@ the right-hand column's position without needing a mod at all:
 | is this a fork | inferred from `subagent_type` | `e.fork` | `fork_turns` / `fork_context` |
 | did the caller pick a model | read out of the raw tool input | `e.model` | `tool_input.model` |
 | agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch | n/a |
+| the `confirm` advice | reachable only on a dispatch it already re-tiers | printed at spawn, always | same as `hook_agent.py`; [see below](#the-advice-half-mostly-unbuilt) |
 
 It also carries three commands — `/jev-probe`, `/jev-route` and
 `/jev-explain` — which are the next three sections.
@@ -531,9 +532,14 @@ key is needed.
 claude plugin test ~/jev-router
 ```
 
-These are the one part of this repo that has never been run: they were written
-on 2.1.267, where `claude plugin test` does not exist yet. Read a failure
-before believing it.
+The harness is the one part of this repo that has never been run: these were
+written on 2.1.267, where `claude plugin test` does not exist yet. Read a
+failure before believing it.
+
+The two pure functions behind the spawn line and the irreversible warning are
+exported for this reason, and have been driven directly under `node` — so
+what is unexercised is the mod's event plumbing, not the text those
+assertions check.
 
 **3. What your subagents actually ran on.** The hook rewriting `model` proves
 only that the hook ran — this proves Claude Code honoured it. Subagent
@@ -751,26 +757,67 @@ false-cheap, the first thing to check is the prompt, and the next lever is
 raising the confidence floor from 0.70. Do not reach for another signal; that
 was tried and measured as contributing nothing.
 
-## The advice half, still unbuilt
+## The advice half, mostly unbuilt
 
-`decide()` returns `advice.confirm` and `advice.clarify`, and nothing has ever
-acted on them. They print. That was defensible when the only front end was a
-`PreToolUse` hook, whose entire vocabulary is a model name — but the finding
-they come from says the response to irreversibility is a confirmation step and
-the response to ambiguity is a question back, and the router currently delivers
-neither. Two sketches, both deliberately not in this PR:
+`decide()` returns `advice.confirm` and `advice.clarify`. The finding they come
+from says the response to irreversibility is a confirmation step and the
+response to ambiguity is a question back, and for a long time the router
+delivered neither — they printed in `./route.py` output nobody was reading at
+dispatch time.
 
-**`confirm` should raise the confirmation posture, not print.** A mod sees
-`tool.check` and can turn one into a prompt, so the shape is obvious: a
-dispatch that scored `irreversible > 0.60` gets its writes confirmed, the rest
-of the session doesn't. The blocker is identity and read/write. `ToolCheckInput`
-in the published declarations is `{tool, input, tool_use_id?}` — no `agentId`,
-so you cannot tell which dispatch a tool call came from, and no `isReadOnly`,
-so you cannot tell a read from a write. The documentation says both exist
-(`agentId` from v2.1.290, `isReadOnly` from v2.1.304); the declarations shipped
-alongside it have neither. Built against what is actually declared, this
-prompts on every tool call in the session, which nobody would keep installed
-for a week. Check the declarations before writing it, not the docs.
+**`confirm` now says so at spawn, in the mod.** A dispatch scoring
+`irreversible > 0.60` gets a line of its own (one line, wrapped here):
+
+```
+deploy the staging bump -- irreversible 0.94: writes outside the working
+tree. Tier unchanged; this is a warning, not a gate.
+```
+
+Printed even when the tier decision itself was worth no line, because a
+dispatch the router agreed with is exactly the case where nothing was said
+before, and "deploy this" agreeing with opus is still a deploy. That is also
+the only case that earns the second sentence: where the router *did* re-tier
+the dispatch, a line above this one has just said so, and "tier unchanged"
+would contradict it. So the warning claims it only when it is the sole thing
+printed.
+
+It does **not** move the tier: a cheap model posting the right comment is
+fine, and on a measured run an old `irreversible` floor sent "reformat this
+comment I already wrote" straight to opus on that basis alone.
+
+**Raising the confirmation posture is still blocked.** A mod sees `tool.check`
+and could turn one into a prompt, so the shape is obvious: a dispatch that
+scored `irreversible > 0.60` gets its writes confirmed, the rest of the session
+doesn't. The blocker is identity and read/write: without a dispatch id on the
+tool call you cannot tell which subagent it came from, and without a read/write
+flag you cannot tell a lookup from a deploy. Lacking either, this prompts on
+every tool call in the session, which nobody would keep installed for a week.
+
+The documentation says both fields exist — `agentId` from v2.1.290,
+`isReadOnly` from v2.1.304. Neither has been seen here: this machine is on
+2.1.267, whose `sdk.d.ts` does not declare a `ToolCheckInput` at all, so what
+those versions actually ship is unverified either way. **Read the declarations
+for the version in front of you before writing this**, and treat a field the
+docs promise as unavailable until you have seen it declared.
+
+Neither hook gets this, and the reason is the same on both — it is not a Codex
+quirk. Both carry a message to the user in `permissionDecisionReason`, and
+both already send one on a dispatch they re-tier, so adding the warning there
+would cost a few characters on a string already in flight. On Codex that
+object additionally needs `permissionDecision: "allow"`, or it is discarded
+along with the `updatedInput` it came with.
+
+The half that cannot be had is the half that matters. When the decision
+changes nothing, both hooks return silently with no output at all, and warning
+there would mean emitting a `hookSpecificOutput` — on Codex, an outright
+`allow` — for a spawn they would otherwise not have spoken about, turning a
+router into a thing that approves tool calls. That trade is the wrong way
+round, and it rules out precisely the case the mod's version exists for: a
+deploy the router agreed with, where nothing else would be said.
+
+This is the one capability gap in the table above that is about the seam
+rather than the host. `$.ui.log` lets the mod speak without also deciding
+something; a `PreToolUse` hook's only voice is attached to a verdict.
 
 **`clarify` should reach the parent before the dispatch does.** A task reading
 `ambiguous > 0.70` is one the subagent will guess at, and the parent is the
@@ -792,9 +839,10 @@ from a scorer you've since moved off.
 **The Jev version is pinned**, to `jev-1.14.0`, rather than `jev-latest`. The
 thresholds were tuned against one version of the scorer, and "latest" moves
 under them without saying so: the JEV-as-a-Judge study
-([arXiv 2609.26550](https://arxiv.org/abs/2609.26550)) ran on 1.13.0 and saw 7
-of 350 decisions change between two of its own collection rounds, and by
-November the API was answering as 1.14.0. Moving is a decision:
+([arXiv 2609.26550](https://arxiv.org/abs/2609.26550)) ran on 1.13.0, and by
+November the API was answering as 1.14.0. The study measures nothing across
+versions; what it does report is that a threshold does not transfer between
+workloads, which is the same argument one step out. Moving is a decision:
 `export JEV_MODEL=jev-1.15.0` (or `jev-latest`, knowingly). If the pinned
 version is ever retired the router stops routing, fails open, and says why in
 the decision log.
@@ -840,7 +888,7 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `selftest.py` | drives the Claude hook with synthetic events; asserts routing and every fail-open path |
 | `selftest_codex.py` | the same for `hook_codex.py`, with the decision pinned so it needs no key |
 | `selftest_route.py` | the Jev client, the cache, the fan-out and the decision log, offline, against a real recorded answer |
-| `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. Never yet run |
+| `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. The harness needs 2.1.287+ and has never run; the two line builders it asserts on are exported and have been driven directly |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `verify_codex.py` | the same against Codex rollouts, joined to the decision log by `task_name`, one verdict per dispatch |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
