@@ -82,9 +82,9 @@ def record(session: str, label: str, default: str, decision: dict,
            task: str = "", dispatch: str | None = None) -> None:
     """Append one decision, including the ones that changed nothing.
 
-    Holds are the whole point of logging this. Both front ends return early
-    when the decision matches the tier already in use, so the asymmetry doing
-    its job has always looked identical to the router not running.
+    Holds are the whole point of logging this. All three front ends return
+    early when the decision matches the tier already in use, so the asymmetry
+    doing its job has always looked identical to the router not running.
 
     `dispatch` is the host's id for the spawn (Claude Code and Codex both call
     it tool_use_id). The label is a description someone wrote and repeats; the

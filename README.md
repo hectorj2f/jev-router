@@ -274,9 +274,10 @@ design-epoch                 opus     0.86  0.71  clarify
 2xhaiku, 3xsonnet, 5xopus
 ```
 
-Five of ten held at opus, every one of them for weak evidence — `tf-apply` at
-confidence 0.00, `binding-guard` at 0.06. That is the asymmetry working, not the
-router failing.
+Five of ten on opus, but only four of those are holds — and every hold is
+there for weak evidence, `tf-apply` at confidence 0.00, `binding-guard` at
+0.06. The fifth, `design-epoch`, cleared the opus line outright at `need` 0.86.
+That is the asymmetry working, not the router failing.
 
 Jev is non-deterministic: identical input drifts by a few hundredths of a point
 between runs, so your numbers will differ slightly from these. Tier assignments
@@ -294,9 +295,10 @@ Piped without `--table` it emits JSON suitable as `args` to
 
 A routing decision is invisible by construction. It is made before the agent
 starts, the only trace it leaves is a model id on a transcript nobody opens,
-and by the time the work comes back wrong the reasoning is gone. Worse, both
-front ends return early when the decision matches the tier already in use — so
-a hold doing its job has always looked exactly like the router not running.
+and by the time the work comes back wrong the reasoning is gone. Worse, all
+three front ends return early when the decision matches the tier already in
+use — so a hold doing its job has always looked exactly like the router not
+running.
 
 Every decision is now appended to `cache/decisions/<session>.jsonl`, including
 the ones that changed nothing, and `explain.py` reads them back:
@@ -422,11 +424,16 @@ a level, or carry a label the questions never had are refused rather than
 renormalised. Rungs are computed on the full ladder and only then clamped to
 what that endpoint served, so a missing tier never moves a probability.
 
-Two things it assumes, both untested: that `depth` and `breadth` are
+Two things it assumes, both untested. That `depth` and `breadth` are
 independent — a deep task is plausibly also broad, and a positive correlation
-would put more mass in the tails than this computes — and that `mechanical`
-can stay a point value, which is sound only because it shifts every cell
-equally rather than spreading mass.
+would put more mass in the tails than this computes. And that `mechanical` can
+stay a point value: a noul has a distribution too, and collapsing it to its
+mean makes every rung probability here a conditional one, computed as though
+`mechanical` were known exactly. Because it enters `need` as a constant it
+shifts all 25 cells by the same amount, so it cannot reorder them — but a
+sharp P(≤ sonnet) sitting just over τ may be sharp only because the spread in
+one of its three inputs was dropped. Which direction that moves a real
+decision is unmeasured.
 
 **This changes no routing.** It is the measuring instrument, not the policy.
 
@@ -483,7 +490,7 @@ the decision and runs the hook by path, so nothing is sent anywhere:
 
 ```bash
 ./selftest_codex.py                                      # 27/27
-./selftest_route.py                                      # 30/30
+./selftest_route.py                                      # 61/61
 ```
 
 `selftest_route.py` covers the plumbing under every front end, also offline:
@@ -496,8 +503,17 @@ Its fixture is a real `jev-1.14.0` answer rather than an invented one.
 The `replay.py` cases hold that fixture to arithmetic done by hand — the 25
 cells of the outer product summing to `.1822/.7953/.0225` — so that moving a
 weight or a line fails the suite rather than silently moving the counterfactual
-too. The rest are the refusals: levels that do not sum, a missing level, a
-label the questions never had, and a rung the endpoint does not serve.
+too. Checked by mutation, not by assertion: each of the three weights and both
+tier lines was moved in turn, and every one of the five reddens the suite.
+
+The rest are the refusals, and they are most of the file: levels that do not
+sum, a missing level, a label the questions never had, a level that is NaN,
+negative, or a number sent as a string, an answer that is a list or a string
+rather than an object, an answer scored under a question set that has since
+been reworded, a rung the endpoint does not serve, and every malformed
+`--tau` — a bar outside (0, 1], a tier name that is not on either ladder, and
+a pair naming an upgrade or the same tier twice. A gate that silently ignored
+a bar you typed would be worse than one that refused it.
 
 Most of it is the shapes that must *not* route: both fork spellings and all
 four ways `fork_turns` can mean "all", a V1 `fork_context` call, a parent on a
@@ -817,7 +833,7 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `install.py` | registers/removes the hook in `~/.claude/settings.json`, or in `~/.codex/hooks.json` with `--codex`. Backs up before every write |
 | `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
-| `decisions.py` | the append-only decision log, one JSONL file per session. Written by both front ends, including the decisions that changed nothing |
+| `decisions.py` | the append-only decision log, one JSONL file per session. Written by all three front ends, including the decisions that changed nothing |
 | `explain.py` | reads the log back: the session as a table, then everything behind any one row |
 | `replay.py` | recomputes logged dispatches under a different downgrade gate, offline. Measures; routes nothing |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
@@ -842,14 +858,15 @@ it after writing this one.
 |---|---|---|
 | mechanism | loopback proxy on `ANTHROPIC_BASE_URL`, with a sentinel model in `/model` | a mod on `agent.spawn`, or a `PreToolUse` hook |
 | scope | every fresh user turn | subagent dispatches only |
-| CLIs | Claude Code and OpenAI Codex | Claude Code |
+| CLIs | Claude Code and OpenAI Codex | Claude Code and OpenAI Codex |
 | the decision | Jev picks the tier; code adjusts it | Jev answers five atomic questions; code combines them |
 | version floor | none — it sits below the CLI | 2.1.287 for the mod, none for the hook |
 | published measurements | none | [Findings](#findings) |
 
-Use theirs if you want this working today across both CLIs and every turn.
-The reason this repo exists is the last row, and the reason it routes nothing
-but dispatches is the row above it: scoring a conversational turn is the thing
+Use theirs if you want this working today on every turn, and on every CLI
+version rather than above a floor. The reason this repo exists is the
+*published measurements* row, and the reason it routes nothing but dispatches
+is the *scope* row: scoring a conversational turn is the thing
 [Findings](#findings) says does not work, measured over 26 real prompts.
 
 Two places the difference is load-bearing rather than cosmetic:

@@ -143,8 +143,16 @@ def table(routed: list[dict], column: str = "shard",
         print(f"{r['id'][:28]:<28} {r['model']:<7} {r['need']:>5.2f} "
               f"{r['conf']:>5.2f}{got}  {', '.join(notes) or '-'}")
 
-    tally = {t: sum(1 for r in routed if r["model"] == t) for t in policy.TIERS}
-    print("\n" + ", ".join(f"{tally[t]}x{t}" for t in policy.TIERS))
+    # Counted over the models actually in front of us, in ladder order, with
+    # anything else appended. Tallying over policy.TIERS alone counts the
+    # running process's ladder: explain.py renders rows read off disk, and a
+    # log may hold both providers -- which printed "0xhaiku, 1xsonnet, 0xopus"
+    # under three rows, and all zeroes for a claude log read under codex.
+    seen = {r["model"] for r in routed}
+    order = [t for t in policy.TIERS if t in seen]
+    order += sorted(seen - set(order))
+    tally = {t: sum(1 for r in routed if r["model"] == t) for t in order}
+    print("\n" + (", ".join(f"{n}x{t}" for t, n in tally.items()) or "nothing"))
 
 
 def main() -> None:
