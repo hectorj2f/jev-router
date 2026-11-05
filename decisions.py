@@ -59,13 +59,40 @@ def path_for(session: str) -> pathlib.Path:
     return LOG_DIR / f"{name}.jsonl"
 
 
+# Bumped whenever a record gains or changes a field a reader depends on.
+#   1 (implicit, no key): the decision and the task.
+#   2: + provider, dispatch, outcome, and the raw Jev answer under `jev`.
+SCHEMA = 2
+
+
+def why_of(e: BaseException) -> str:
+    """One spelling of a failure, for the `why` all three front ends write.
+
+    jev.py reports its own failures as SystemExit carrying a sentence, so the
+    type name would only get in the way; anything else reaching a front end is
+    a bug rather than a message, and `KeyError: 'breadth'` without the type
+    reads as the bare string 'breadth'. Uniform because calibration parses
+    this field across providers, and a per-front-end spelling would have to be
+    un-picked later.
+    """
+    return str(e) if isinstance(e, SystemExit) else f"{type(e).__name__}: {e}"
+
+
 def record(session: str, label: str, default: str, decision: dict,
-           task: str = "") -> None:
+           task: str = "", dispatch: str | None = None) -> None:
     """Append one decision, including the ones that changed nothing.
 
     Holds are the whole point of logging this. Both front ends return early
     when the decision matches the tier already in use, so the asymmetry doing
     its job has always looked identical to the router not running.
+
+    `dispatch` is the host's id for the spawn (Claude Code and Codex both call
+    it tool_use_id). The label is a description someone wrote and repeats; the
+    id is what a later outcome -- was the work this dispatch produced good
+    enough? -- can be joined back on without guessing.
+
+    `outcome` starts empty. It is the half of the record a threshold has to be
+    fitted on, and nothing at decision time can know it.
 
     Never raises. It is called from a path that fails open, and a log that can
     take down a dispatch is worse than no log.
@@ -74,8 +101,10 @@ def record(session: str, label: str, default: str, decision: dict,
         return
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        entry = {"at": time.time(), "label": label, "default": default,
-                 "task": task[:TASK_LIMIT], "task_len": len(task), **decision}
+        entry = {"schema": SCHEMA, "at": time.time(), "label": label,
+                 "dispatch": dispatch or None, "provider": policy.PROVIDER.NAME,
+                 "default": default, "task": task[:TASK_LIMIT],
+                 "task_len": len(task), "outcome": None, **decision}
         line = json.dumps(entry, separators=(",", ":")) + "\n"
         p = path_for(session)
         # Claim the file before appending to it. _prune() in a sibling hook

@@ -18,7 +18,7 @@ import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import providers  # noqa: E402
-from jev import system_one  # noqa: E402
+from jev import model_name, system_one  # noqa: E402
 
 CACHE_DIR = pathlib.Path(__file__).parent / "cache"
 CACHE_TTL = 7 * 24 * 3600
@@ -185,30 +185,84 @@ def nearest_tier(tier: str, avail: list[str], ladder: list[str] | None = None) -
     return avail[-1] if avail else tier
 
 
-def ask(state: str, cache: bool = True) -> dict:
-    """Jev's raw answers for one task, memoized on disk by the task text.
+# Which question set a logged answer was given to. Short because it is a label
+# rather than a security property: two records with the same hash were scored
+# by the same questions and can be compared, and two with different ones cannot.
+QUESTIONS_HASH = hashlib.sha256(
+    json.dumps(QUESTIONS, sort_keys=True).encode()).hexdigest()[:12]
 
-    The status line re-runs on every assistant message, and the hooks can see
-    the same task more than once, so an uncached call here would mean a request
-    per redraw.
+# The fields each answer type has to carry for decide() to read it.
+_NUMERIC = {"score": ("score", "confidence"), "noul": ("noul",), "choice": ("confidence",)}
+
+
+def check_answers(answers, questions: dict = QUESTIONS) -> None:
+    """Raise ValueError unless every question got an answer decide() can read.
+
+    Checked before anything is cached, because the cache keeps what it is given
+    for a week: an answer missing a field used to be stored, then raise KeyError
+    inside decide() on every dispatch of that task until it expired.
     """
-    if not cache:
-        return system_one(state, QUESTIONS)["answers"]
+    if not isinstance(answers, dict):
+        raise ValueError(f"jev: answers is {type(answers).__name__}, not an object")
+    for name, q in questions.items():
+        a = answers.get(name)
+        if not isinstance(a, dict) or a.get("type") != q["type"]:
+            raise ValueError(f"jev: no {q['type']} answer for {name!r}")
+        for field in _NUMERIC.get(q["type"], ()):
+            v = a.get(field)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"jev: {name}.{field} is {v!r}, not a number")
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cache_path(state: str, requested: str) -> pathlib.Path:
     # The questions are part of the key, not just the state. Keying on the state
-    # alone means editing QUESTIONS silently serves answers to the old ones.
-    key = json.dumps([state, QUESTIONS], sort_keys=True).encode()
-    path = CACHE_DIR / (hashlib.sha256(key).hexdigest()[:32] + ".json")
-    if path.is_file() and time.time() - path.stat().st_mtime < CACHE_TTL:
-        try:
-            return json.loads(path.read_text())
-        except json.JSONDecodeError:
-            pass  # fall through and refetch
+    # alone means editing QUESTIONS silently serves answers to the old ones. The
+    # requested model is part of it for the same reason: a week-old answer from
+    # one version of Jev is not an answer from the version now pinned.
+    key = json.dumps([state, QUESTIONS, requested], sort_keys=True).encode()
+    return CACHE_DIR / (hashlib.sha256(key).hexdigest()[:32] + ".json")
 
-    answers = system_one(state, QUESTIONS)["answers"]
-    path.write_text(json.dumps(answers))
-    return answers
+
+def ask_meta(state: str, cache: bool = True) -> dict:
+    """Jev's raw answers for one task, with which Jev gave them.
+
+    Returns {"answers", "model", "requested", "cached"}. `model` is the version
+    the response says answered, which is not necessarily `requested`: an alias
+    such as jev-latest resolves server-side, and only the response says to what.
+
+    Memoized on disk by task text, question set and requested model. The hooks
+    can see the same task more than once, so an uncached call here would mean a
+    request per sighting.
+    """
+    requested = model_name()
+    path = _cache_path(state, requested) if cache else None
+    if path is not None and path.is_file() \
+            and time.time() - path.stat().st_mtime < CACHE_TTL:
+        try:
+            rec = json.loads(path.read_text())
+            # A bare answers object is the format before the model was kept.
+            if "answers" not in rec:
+                rec = {"answers": rec, "model": None}
+            check_answers(rec["answers"])
+            return {"answers": rec["answers"], "model": rec.get("model"),
+                    "requested": requested, "cached": True}
+        except (ValueError, TypeError, KeyError):
+            pass  # unreadable or incomplete: refetch rather than serve it
+
+    resp = system_one(state, QUESTIONS, model=requested)
+    answers = resp.get("answers") if isinstance(resp, dict) else None
+    check_answers(answers)
+    model = resp.get("model")
+    if path is not None:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"model": model, "answers": answers}))
+    return {"answers": answers, "model": model, "requested": requested,
+            "cached": False}
+
+
+def ask(state: str, cache: bool = True) -> dict:
+    """Jev's raw answers for one task. See ask_meta for which Jev gave them."""
+    return ask_meta(state, cache=cache)["answers"]
 
 
 def decide(ans: dict, default: str | None = None, tiers: list[str] | None = None,
@@ -298,7 +352,26 @@ def decide(ans: dict, default: str | None = None, tiers: list[str] | None = None
 
 
 def route(state: str, default: str | None = None, cache: bool = True) -> dict:
-    return decide(ask(state, cache=cache), default=default)
+    """decide() over a fresh or cached answer, carrying the answer with it.
+
+    The raw answer rides along under `jev` so the decision log keeps what was
+    measured, not only what was concluded from it. Without the full level
+    probabilities a different gate cannot be replayed over past dispatches, and
+    every threshold change would have to be judged on new traffic only.
+    """
+    meta = ask_meta(state, cache=cache)
+    plan = decide(meta["answers"], default=default)
+    plan["jev"] = {
+        "model": meta["model"],
+        "requested": meta["requested"],
+        "questions": QUESTIONS_HASH,
+        "cached": meta["cached"],
+        # The legend repeats QUESTIONS' own criteria text on every answer, and
+        # the hash above already says which criteria those were.
+        "answers": {name: {k: v for k, v in a.items() if k != "legend"}
+                    for name, a in meta["answers"].items()},
+    }
+    return plan
 
 
 def _reader(name: str):

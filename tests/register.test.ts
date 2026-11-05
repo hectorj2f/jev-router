@@ -100,7 +100,8 @@ test('a dispatch is priced on its type, its description and its task', async ($,
   await $.agent.spawn(dispatch())
 
   expect(runs).toHaveLength(1)
-  expect(JSON.parse(runs[0].stdin ?? '')).toEqual([{ id: LABEL, task: STATE }])
+  expect(JSON.parse(runs[0].stdin ?? '')).toEqual(
+    [{ id: LABEL, task: STATE, dispatch: 'toolu_01test' }])
 })
 
 test('the decision is logged against the session that made it', async ($, on) => {

@@ -39,6 +39,20 @@ STATE_CHAR_LIMIT = 100_000
 
 RETRYABLE = {429, 529}
 
+# Pinned rather than "jev-latest". A threshold is tuned against one version of
+# the scorer, and "latest" moves under it without saying so: the policy here
+# was tuned in October 2026, the JEV-as-a-Judge study (arXiv 2609.26550) ran on
+# 1.13.0, and by 5 November the API was answering as 1.14.0. Between two of
+# that study's own collection rounds 7 of 350 decisions changed. So a version
+# change is a decision someone makes, on purpose, with JEV_MODEL -- and if the
+# pinned version is ever retired, the router stops routing and says why in the
+# decision log, rather than carrying on with numbers that mean something else.
+DEFAULT_MODEL = "jev-1.14.0"
+
+
+def model_name() -> str:
+    return os.environ.get("JEV_MODEL", "").strip() or DEFAULT_MODEL
+
 
 def api_key() -> str:
     key = os.environ.get("TYPESAFE_API_KEY")
@@ -52,9 +66,16 @@ def api_key() -> str:
 
 
 def system_one(
-    state, questions: dict, model: str = "jev-latest", timeout: float = 30.0
+    state, questions: dict, model: str | None = None, timeout: float = 30.0
 ) -> dict:
-    """One POST to /v1/systemone, with backoff on the two retryable statuses."""
+    """One POST to /v1/systemone, with backoff on the two retryable statuses.
+
+    Every failure leaves as SystemExit carrying a message, so a caller has one
+    thing to catch. That used to be true only of HTTP errors: a refused
+    connection, a timeout or a body that was not JSON escaped as their own
+    exceptions, and route.py's fan-out lost every shard to one of them.
+    """
+    model = model or model_name()
     body = json.dumps({"state": state, "model": model, "questions": questions})
     req = urllib.request.Request(
         ENDPOINT,
@@ -80,6 +101,12 @@ def system_one(
             wait = float(e.headers.get("retry-after") or delay)
             time.sleep(wait)
             delay *= 2
+        except (urllib.error.URLError, OSError) as e:
+            # Not retried: the hooks run against a few-second budget, and a
+            # network that refused once is not about to change its mind.
+            raise SystemExit(f"jev: unreachable: {e}") from e
+        except ValueError as e:  # json.JSONDecodeError is a ValueError
+            raise SystemExit(f"jev: response was not JSON: {e}") from e
     raise SystemExit("jev: unreachable")
 
 
@@ -107,7 +134,8 @@ def main() -> None:
     p.add_argument("--questions-file", help="JSON file holding the questions map")
     p.add_argument("--noul", action="append", default=[], metavar="KEY=INSTRUCTIONS",
                    help="add a noul question inline; repeatable")
-    p.add_argument("--model", default="jev-latest")
+    p.add_argument("--model", default=None,
+                   help=f"defaults to $JEV_MODEL, else {DEFAULT_MODEL}")
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--summary", action="store_true",
                    help="print one line per answer instead of the raw JSON")

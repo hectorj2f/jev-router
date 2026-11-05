@@ -37,16 +37,21 @@ def route_one(shard: dict, default: str, cache: bool,
     out = dict(shard)
     try:
         decision = policy.route(shard["task"], default=default, cache=cache)
-    except SystemExit as e:
+    except (SystemExit, Exception) as e:
         # Fail open: an unrouted shard runs on the default, it does not fail the
         # fan-out. A router that can take the whole run down with it is worse
         # than no router.
+        #
+        # Exception as well as SystemExit. jev.system_one reports its own
+        # failures as SystemExit, but a malformed answer used to raise KeyError
+        # inside decide(), and that escaped pool.map and lost every shard of
+        # the fan-out -- with nothing logged, since the record is written below.
         decision = {"model": default, "effort": policy.EFFORT[default],
-                    "why": f"jev error: {e}"}
+                    "why": f"jev error: {decisions.why_of(e)}"}
     # Logged including the failures, which is the half of "did it even fire"
     # that nothing else answers.
     decisions.record(session or "", str(shard.get("id") or "task"), default,
-                     decision, shard["task"])
+                     decision, shard["task"], dispatch=shard.get("dispatch"))
     return {**out, **decision}
 
 
@@ -141,7 +146,8 @@ def main() -> None:
     # taking down the whole fan-out from the one path whose own comment says
     # a router must never be able to do that.
     p.add_argument("--default", default=policy.TIERS[1], choices=policy.TIERS,
-                   help="the model the fan-out would otherwise use")
+                   help="the model the fan-out would otherwise use "
+                        f"(default {policy.TIERS[1]})")
     p.add_argument("--table", action="store_true", help="human-readable output")
     p.add_argument("--json", action="store_true", help="JSON, even for positional tasks")
     p.add_argument("--no-cache", action="store_true", help="bypass the disk cache")

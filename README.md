@@ -341,6 +341,22 @@ and isn't recorded. It is pruned at seven days, task text is cut at 4,000
 characters with the original length kept alongside, and `cache/` is
 gitignored. `JEV_DECISIONS_DIR` moves it.
 
+Each record (schema 2) also carries what a threshold will one day be fitted
+on, rather than only what was concluded:
+
+- `jev` — the raw answer: every level probability of `depth` and `breadth`,
+  the three nouls, the version Jev says answered, the version requested, and a
+  hash of the question set. A different gate can then be replayed over past
+  dispatches instead of judged on new traffic alone.
+- `dispatch` — the host's `tool_use_id` for the spawn, so an outcome found
+  later joins back by id rather than by a label that repeats.
+- `outcome` — `null` at decision time, because nothing then can know whether
+  the work was good enough. It is the field calibration needs, and nothing
+  fills it yet.
+- `provider`, and `why` on any decision Jev could not make — a failure is
+  logged by all three front ends, so "could not reach Jev" and "ran and held"
+  no longer look the same.
+
 The idea is [gargpratyush/jev-router](https://github.com/gargpratyush/jev-router)'s
 — see [Related work](#related-work). Theirs explains one decision, because a
 proxy that routes conversational turns has exactly one live at a time.
@@ -377,8 +393,10 @@ PASS  a torn line costs one record, not the log
 PASS  a session id cannot escape the log dir
 PASS  no session id, no log
 PASS  a decision that changed nothing is still logged
+PASS  a jev outage is logged, not swallowed
+PASS  a stale log survives a concurrent prune
 
-21/21 passed
+23/23 passed
 ```
 
 The routing cases pin `JEV_TIERS` so they test the policy rather than your
@@ -395,8 +413,16 @@ The Codex hook has its own suite, which needs no key at all — every case pins
 the decision and runs the hook by path, so nothing is sent anywhere:
 
 ```bash
-./selftest_codex.py                                      # 22/22
+./selftest_codex.py                                      # 27/27
+./selftest_route.py                                      # 20/20
 ```
+
+`selftest_route.py` covers the plumbing under every front end, also offline:
+that the Jev client turns a refused connection, a timeout or a non-JSON body
+into one catchable error; that it asks for the pinned version; that the cache
+is keyed on that version and never stores an answer missing a field; and that
+one bad shard in a `route.py` fan-out costs that shard, not the whole run.
+Its fixture is a real `jev-1.14.0` answer rather than an invented one.
 
 Most of it is the shapes that must *not* route: both fork spellings and all
 four ways `fork_turns` can mean "all", a V1 `fork_context` call, a parent on a
@@ -668,8 +694,19 @@ that fires on nearly everything is noise. It needs a threshold measured on
 
 ~$0.00003 per task routed ($0.042/Mtok input, output free). A 50-shard fan-out
 is about a tenth of a cent. Answers are memoized for 7 days in `cache/`, keyed
-on the task text *and* the question set — the latter matters, since keying on
-the text alone silently serves answers to questions you've since edited.
+on the task text, the question set *and* the Jev version requested — keying on
+the text alone silently serves answers to questions you've since edited, or
+from a scorer you've since moved off.
+
+**The Jev version is pinned**, to `jev-1.14.0`, rather than `jev-latest`. The
+thresholds were tuned against one version of the scorer, and "latest" moves
+under them without saying so: the JEV-as-a-Judge study
+([arXiv 2609.26550](https://arxiv.org/abs/2609.26550)) ran on 1.13.0 and saw 7
+of 350 decisions change between two of its own collection rounds, and by
+November the API was answering as 1.14.0. Moving is a decision:
+`export JEV_MODEL=jev-1.15.0` (or `jev-latest`, knowingly). If the pinned
+version is ever retired the router stops routing, fails open, and says why in
+the decision log.
 
 **Every routed task is POSTed to `api.typesafe.ai`**, carrying task text, file
 paths, and whatever else is in the prompt. That is a real disclosure decision,
@@ -710,6 +747,7 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the Claude hook with synthetic events; asserts routing and every fail-open path |
 | `selftest_codex.py` | the same for `hook_codex.py`, with the decision pinned so it needs no key |
+| `selftest_route.py` | the Jev client, the cache, the fan-out and the decision log, offline, against a real recorded answer |
 | `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. Never yet run |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `verify_codex.py` | the same against Codex rollouts, joined to the decision log by `task_name`, one verdict per dispatch |

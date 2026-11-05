@@ -52,11 +52,15 @@ function tierOf(model) {
  * /jev-explain reads back. Recording on that side rather than this one means
  * the held decisions are logged too -- they return early here, by design.
  */
-async function routeOne($, state, parent, label, session) {
+async function routeOne($, state, parent, label, session, dispatch) {
+  // `dispatch` is the spawn's tool_use_id, logged so an outcome found later can
+  // be joined to this decision by id rather than by a label that repeats.
+  // JSON.stringify drops it when undefined, which route.py reads as no id.
   const run = await $.process.run(
     [`${$.plugin.root}/route.py`, '--default', parent, '--session', session,
       '--json'],
-    { stdin: JSON.stringify([{ id: label, task: state }]), timeoutMs: ROUTE_TIMEOUT_MS },
+    { stdin: JSON.stringify([{ id: label, task: state, dispatch }]),
+      timeoutMs: ROUTE_TIMEOUT_MS },
   )
   if (run.exitCode !== 0) return null
   const routed = JSON.parse(run.stdout)
@@ -139,7 +143,8 @@ export function register(on) {
     // hook has returned, where nothing can catch it.
     let plan = null
     try {
-      plan = await routeOne($, state, parent, label, String(await $.session.id()))
+      plan = await routeOne($, state, parent, label, String(await $.session.id()),
+        e.tool_use_id)
     } catch {
       return next(e)
     }

@@ -94,14 +94,22 @@ def main() -> None:
     state = (f"Agent type: {agent}\n"
              f"Description: {ti.get('task_name') or ''}\n"
              f"Task:\n{task}")
-    plan = policy.route(state[:STATE_LIMIT], default=default)
+    session = ev.get("session_id") or pathlib.Path(
+        ev.get("transcript_path") or "").stem
+    label = ti.get("task_name") or agent
+    try:
+        plan = policy.route(state[:STATE_LIMIT], default=default)
+    except (Exception, SystemExit) as e:
+        # Both, and they fall through to the one record() below, for the
+        # reasons hook_agent.py gives: "could not reach Jev" and "held" both
+        # leave the spawn alone, and only the log tells them apart.
+        plan = {"model": default, "effort": policy.EFFORT[default],
+                "why": f"jev error: {decisions.why_of(e)}"}
 
     # Before the early return, not after: a decision that changed nothing is
     # still a decision, and it is the one /jev-explain exists to show.
-    session = ev.get("session_id") or pathlib.Path(
-        ev.get("transcript_path") or "").stem
-    decisions.record(session, ti.get("task_name") or agent, default, plan,
-                     state)
+    decisions.record(session, label, default, plan,
+                     state, dispatch=ev.get("tool_use_id"))
 
     if plan["model"] == default:
         return
@@ -136,5 +144,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except (Exception, SystemExit):
+        # SystemExit too: it is how jev.py reports a missing key, an HTTP error
+        # or a network failure. Uncaught, it exits 1 with a message on stderr,
+        # and what Codex does with a failed PreToolUse hook is not something to
+        # find out on a live spawn.
         sys.exit(0)
