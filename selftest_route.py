@@ -162,15 +162,35 @@ def main() -> int:
           not other["cached"] and calls == [jev.DEFAULT_MODEL, "jev-1.15.0"],
           f"calls {calls}")
 
-    # Written as the old code wrote it: the bare answers object, no model.
+    # The bare answers object is how the old code wrote an entry. Putting the
+    # requested model into the key means nothing it wrote can be found at a
+    # path the new code looks up, so the branch that used to read that shape
+    # was unreachable. What has to hold now is that such a file is refetched
+    # rather than served -- which is also what happens to any entry too
+    # damaged to read.
     legacy_task = "legacy-format task"
     policy._cache_path(legacy_task, jev.DEFAULT_MODEL).write_text(
         json.dumps(REAL["answers"]))
-    with patched(policy, "system_one", lambda *a, **k: 1 / 0):
+    with patched(policy, "system_one", fake_jev):
         legacy = policy.ask_meta(legacy_task)
-    check("cache: the bare-answers format still reads",
-          legacy["cached"] and legacy["model"] is None
-          and legacy["answers"]["mechanical"]["noul"] == 0.88, f"{legacy!r:.80}")
+    check("cache: a bare-answers entry is refetched, not served",
+          not legacy["cached"] and legacy["model"] == "jev-1.14.0",
+          f"{legacy!r:.80}")
+
+    # An entry that cannot be read at all. This used to escape as OSError from
+    # outside the try and disable routing for the task until the file expired.
+    unreadable_task = "an entry we cannot open"
+    bad_path = policy._cache_path(unreadable_task, jev.DEFAULT_MODEL)
+    bad_path.write_text(json.dumps(REAL))
+    bad_path.chmod(0o000)
+    try:
+        with patched(policy, "system_one", fake_jev):
+            recovered = policy.ask_meta(unreadable_task)
+    finally:
+        bad_path.chmod(0o600)
+    check("cache: an unreadable entry refetches rather than raising",
+          not recovered["cached"] and recovered["model"] == "jev-1.14.0",
+          f"{recovered!r:.80}")
 
     broken = copy.deepcopy(REAL)
     del broken["answers"]["breadth"]
@@ -305,17 +325,120 @@ def main() -> int:
           got["model"] == "sonnet" and abs(got["probs"]["haiku"] - .1822) < 5e-4,
           f"{got}")
 
+    # The upgrade arm, which a top-rung parent can never reach: every case
+    # above dispatches from opus, so `tiers.index(t) > here` is false on all of
+    # them and the whole block could be deleted without turning the suite red.
+    from_haiku = {**copy.deepcopy(full), "default": "haiku", "model": "haiku"}
+    up = replay.replay_one(from_haiku, {"*": 0.70}, replay.UP_BAR)
+    check("replay: mass above the parent upgrades, and names the bar it cleared",
+          up["model"] == "sonnet" and "P(>= sonnet)" in up["why"]
+          and ">= 0.5" in up["why"], f"{up}")
+    # P(>= opus) is .0225 here, so only a bar under that reaches opus. This
+    # fails if the upgrade takes the first rung it finds rather than the
+    # dearest one clearing the bar.
+    check("replay: the upgrade takes the dearest rung the mass clears",
+          replay.replay_one(from_haiku, {"*": 0.70}, 0.02)["model"] == "opus",
+          f"{replay.replay_one(from_haiku, {'*': 0.70}, 0.02)}")
+    # ... and is clamped to what the endpoint serves, exactly as a downgrade is.
+    thin = {**from_haiku, "tiers": ["haiku", "opus"]}
+    check("replay: an upgrade to a rung not served is clamped up too",
+          replay.replay_one(thin, {"*": 0.70}, replay.UP_BAR)["model"] == "opus",
+          f"{replay.replay_one(thin, {'*': 0.70}, replay.UP_BAR)}")
+
+    # A per-transition bar has to beat the global one, or --tau 'opus>haiku='
+    # is decoration. At a global 0.15 this answer reaches haiku (above); naming
+    # that transition alone must hold it at sonnet without touching the rest.
+    split = replay.replay_one(full, {"*": 0.15, ("opus", "haiku"): 0.95},
+                              replay.UP_BAR)
+    check("replay: a bar on one transition binds only that transition",
+          split["model"] == "sonnet" and "P(<= sonnet) 0.977" in split["why"],
+          f"{split}")
+    # The near miss is the smallest gap, not the last rung tried. haiku misses
+    # 0.95 by .768 and sonnet misses 0.99 by .013, so sonnet is the one to say.
+    near = replay.replay_one(full, {"*": 0.95, ("opus", "sonnet"): 0.99},
+                             replay.UP_BAR)
+    check("replay: a hold reports the bar it came closest to clearing",
+          near["model"] == "opus" and "P(<= sonnet) 0.977 < 0.99" in near["why"],
+          f"{near}")
+
     for name, broken in [
         ("levels that do not sum to 1", {"0": 0.1, "1": 0.1, "2": 0.1, "3": 0.1, "4": 0.1}),
         ("a level that is not there", {"0": 0.2, "1": 0.3, "2": 0.5}),
         ("a label the questions do not have", {"0": .04, "1": .13, "2": .68,
                                                "3": .15, "4": 0.0, "5": 0.0}),
+        # Every comparison against NaN is False, so this passed the sign test
+        # and the sum test and arrived at rung_of as a need that falls through
+        # both lines to the cheapest rung.
+        ("a level that is NaN", {"0": float("nan"), "1": 9.0, "2": 9.0,
+                                 "3": 9.0, "4": 9.0}),
+        ("a level that is negative", {"0": -.04, "1": .17, "2": .68,
+                                      "3": .15, "4": 0.04}),
+        ("a level sent as a string", {"0": "0.04", "1": .13, "2": .68,
+                                      "3": .15, "4": 0.0}),
     ]:
         bad = copy.deepcopy(full)
         bad["jev"]["answers"]["depth"]["probabilities"] = broken
         out = replay.replay_one(bad, {"*": 0.70}, replay.UP_BAR)
         check(f"replay: {name} is skipped, not renormalised into a decision",
               "skip" in out and "model" not in out, f"{out}")
+
+    # ... but a miss inside SUM_TOLERANCE is accepted and renormalised, which
+    # is the whole reason the tolerance is not zero.
+    near_one = copy.deepcopy(full)
+    near_one["jev"]["answers"]["depth"]["probabilities"] = {
+        "0": .04, "1": .13, "2": .68, "3": .15, "4": .02}
+    out = replay.replay_one(near_one, {"*": 0.70}, replay.UP_BAR)
+    check("replay: levels missing 1 by less than the tolerance are renormalised",
+          out.get("model") == "sonnet"
+          and abs(sum(out["probs"].values()) - 1.0) < 1e-9, f"{out}")
+
+    # A malformed answer object, rather than malformed probabilities inside
+    # one. This used to be an AttributeError that took the whole session with
+    # it -- including the rows that were fine.
+    for name, bad_answer in [("a bare float", 0.88), ("a list", ["x"]),
+                             ("a string", "x")]:
+        bad = copy.deepcopy(full)
+        bad["jev"]["answers"]["mechanical"] = bad_answer
+        out = replay.replay_one(bad, {"*": 0.70}, replay.UP_BAR)
+        check(f"replay: an answer that is {name} is skipped, not raised",
+              "skip" in out, f"{out}")
+
+    # The hash is why it is recorded: rewording one criterion leaves the level
+    # count intact, so nothing else here can tell that the probabilities were
+    # given to different questions.
+    stale = copy.deepcopy(full)
+    stale["jev"]["questions"] = "0123456789ab"
+    out = replay.replay_one(stale, {"*": 0.70}, replay.UP_BAR)
+    check("replay: an answer scored under other questions is skipped",
+          "skip" in out and "question set" in out["skip"], f"{out}")
+
+    # The bars are probabilities. Both gates accumulate before testing and
+    # test inclusively, so a bar of 0 is cleared by the first rung examined --
+    # `--up-bar 0` reads as "no upgrade bar" and would mean "always opus".
+    for bad_bar in ["0", "-1", "1.5", "nan", "abc"]:
+        try:
+            replay.parse_tau([bad_bar])
+            refused = ""
+        except SystemExit as e:
+            refused = str(e)
+        check(f"replay: --tau {bad_bar} is refused, not used as a bar",
+              "probability bar" in refused or "not a number" in refused,
+              f"{refused!r}")
+    # A transition that can never be consulted is almost always a typo, and
+    # the table it produces is indistinguishable from one computed at the bar
+    # you meant.
+    for bad_pair in ["sonet>haiku=0.95", "opus>opus=0.5", "haiku>opus=0.9",
+                     "opus>luna=0.9"]:
+        try:
+            replay.parse_tau([bad_pair])
+            refused = ""
+        except SystemExit as e:
+            refused = str(e)
+        check(f"replay: --tau {bad_pair} is refused rather than ignored",
+              bool(refused), f"{refused!r}")
+    check("replay: a real downgrade transition is accepted, on either ladder",
+          replay.parse_tau(["opus>haiku=0.95"])[("opus", "haiku")] == 0.95
+          and replay.parse_tau(["astra>luna=0.9"])[("astra", "luna")] == 0.9)
 
     # A record written under the other provider replays on that ladder, not on
     # this process's. One log holds both.
@@ -326,25 +449,52 @@ def main() -> int:
           got.get("model") == "sol" and got.get("tiers") == ["luna", "sol", "astra"],
           f"{got}")
 
+    # Three rows: one schema 1 with nothing to replay, one where (b) agrees,
+    # and one where it does not. The disagreeing row is what pins the `*` --
+    # without it, marking every row and marking none both pass.
+    held_rec = {**copy.deepcopy(full), "label": "deploy the bump",
+                "model": "opus", "held": True, "suggested": "sonnet"}
     with open(decisions.path_for("replayed"), "w") as f:
-        f.write(json.dumps(old) + "\n" + json.dumps(full) + "\n")
+        for r in (old, full, held_rec):
+            f.write(json.dumps(r) + "\n")
     shown = subprocess.run([sys.executable, str(HERE / "explain.py"),
                             "--session", "replayed", "--replay"],
                            capture_output=True, text=True, timeout=60,
                            env={**os.environ, "JEV_DECISIONS_DIR": str(decisions.LOG_DIR)})
+    out = shown.stdout
+    # Read the column by its offset in the header rather than by searching the
+    # whole row: "does the word sonnet appear twice" is satisfied just as well
+    # by a renderer that prints the replay column in the wrong place.
+    hdr = next((ln for ln in out.splitlines() if ln.startswith("decision")), "")
+    at = hdr.find("(b)")
     # The numbered rows only: the tally line below the table also starts with
     # a digit.
-    lines = {ln.split("  ")[1].strip(): ln for ln in shown.stdout.splitlines()
-             if ln.startswith(("1  ", "2  "))}
-    check("explain --replay: the extra column covers schema 2 and blanks schema 1",
-          shown.returncode == 0 and "(b)" in shown.stdout
-          # The gate's own column, not the model column: at this tau (b)
-          # agrees, so the row says sonnet twice and the schema 1 row once.
-          and lines.get("rename DueAt", "").count("sonnet") == 2
-          # Its own row routed and has a model; the only `--` on it is the
-          # replay column declining a record that kept no answer.
-          and lines.get("pre-schema", "").count("--") == 1,
-          (shown.stderr or json.dumps(lines))[-200:])
+    rows_by_label = {ln.split("  ")[1].strip(): ln for ln in out.splitlines()
+                     if ln.startswith(("1  ", "2  ", "3  "))}
+    col = {k: v[at:at + 9].strip() for k, v in rows_by_label.items()} if at > 0 else {}
+    check("explain --replay: the (b) column sits between conf and advice",
+          shown.returncode == 0 and at > hdr.find("conf") > 0
+          and at < hdr.find("advice"), f"header {hdr!r}")
+    check("explain --replay: a record with no answer kept blanks the column",
+          col.get("pre-schema") == "--", f"{col}")
+    check("explain --replay: a row the gate agrees with is unmarked",
+          col.get("rename DueAt") == "sonnet", f"{col}")
+    check("explain --replay: a row it disagrees with is marked",
+          col.get("deploy the bump") == "sonnet *", f"{col}")
+    # The footnote and the heading are separate producers of the string "(b)",
+    # so each has to be asserted on its own or neither is pinned.
+    check("explain --replay: the footnote names the tau the column used",
+          f"unmeasured tau of {replay.TAU}" in out, out[-200:])
+    # The views with nowhere to put a column say so rather than ignoring it.
+    for flag in ("--json", "--last", "--sessions"):
+        refused = subprocess.run(
+            [sys.executable, str(HERE / "explain.py"), "--session", "replayed",
+             "--replay", flag], capture_output=True, text=True, timeout=60,
+            env={**os.environ, "JEV_DECISIONS_DIR": str(decisions.LOG_DIR)})
+        check(f"explain --replay {flag}: refused, not silently dropped",
+              refused.returncode != 0 and "nowhere to go" in
+              (refused.stderr + refused.stdout), f"{refused.returncode} "
+              f"{(refused.stderr or refused.stdout)[-90:]}")
 
     # --- the default tier follows the provider -------------------------------
     helped = subprocess.run([sys.executable, str(HERE / "route.py"), "--help"],

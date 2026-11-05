@@ -94,6 +94,15 @@ def main() -> None:
               "./route.py a --session to write under.")
         return
 
+    # --replay only has a column to add to the table view. Silently dropping it
+    # on the other four leaves you reading an ordinary view believing it is a
+    # counterfactual one; ./replay.py --json is the answer for the JSON case.
+    if args.replay and (args.sessions or args.json or args.last
+                        or args.index is not None):
+        sys.exit("--replay adds a column to the table view; it has nowhere to "
+                 "go on --sessions, --json, --last or a single decision.\n"
+                 "For JSON, ./replay.py --json prints the gate's own output.")
+
     if args.sessions:
         list_sessions(known, args.json)
         return

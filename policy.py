@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pathlib
 import sys
@@ -207,8 +208,14 @@ def nearest_tier(tier: str, avail: list[str], ladder: list[str] | None = None) -
 QUESTIONS_HASH = hashlib.sha256(
     json.dumps(QUESTIONS, sort_keys=True).encode()).hexdigest()[:12]
 
-# The fields each answer type has to carry for decide() to read it.
-_NUMERIC = {"score": ("score", "confidence"), "noul": ("noul",), "choice": ("confidence",)}
+# The fields each answer type has to carry for decide() to read it, and the
+# range each has to be in. None means "0 to the last index of this question's
+# own criteria list", which only a score has.
+_NUMERIC = {
+    "score": (("score", None), ("confidence", (0.0, 1.0))),
+    "noul": (("noul", (0.0, 1.0)),),
+    "choice": (("confidence", (0.0, 1.0)),),
+}
 
 
 def check_answers(answers, questions: dict = QUESTIONS) -> None:
@@ -217,6 +224,13 @@ def check_answers(answers, questions: dict = QUESTIONS) -> None:
     Checked before anything is cached, because the cache keeps what it is given
     for a week: an answer missing a field used to be stored, then raise KeyError
     inside decide() on every dispatch of that task until it expired.
+
+    Range and finiteness are part of "can read", not pedantry. Both lines in
+    rung_of are `>=` comparisons, and every comparison against NaN is False, so
+    a NaN need falls through to the *cheapest* rung with no error anywhere --
+    json.load parses a bare NaN token by default, so it arrives this far. An
+    out-of-range noul is as bad in the other direction: mechanical = 7.0 gives
+    need = -0.75 and clears the `> 0.75` downgrade gate at the same time.
     """
     if not isinstance(answers, dict):
         raise ValueError(f"jev: answers is {type(answers).__name__}, not an object")
@@ -224,10 +238,21 @@ def check_answers(answers, questions: dict = QUESTIONS) -> None:
         a = answers.get(name)
         if not isinstance(a, dict) or a.get("type") != q["type"]:
             raise ValueError(f"jev: no {q['type']} answer for {name!r}")
-        for field in _NUMERIC.get(q["type"], ()):
+        if q["type"] not in _NUMERIC:
+            # Presence-only was the silent default here, in a function whose
+            # whole promise is that decide() can read what survives it.
+            raise ValueError(f"jev: {name!r} has unchecked type {q['type']!r}; "
+                             f"teach check_answers about it before asking it")
+        for field, bounds in _NUMERIC[q["type"]]:
             v = a.get(field)
             if isinstance(v, bool) or not isinstance(v, (int, float)):
                 raise ValueError(f"jev: {name}.{field} is {v!r}, not a number")
+            if not math.isfinite(v):
+                raise ValueError(f"jev: {name}.{field} is {v!r}, not finite")
+            lo, hi = bounds or (0, len(q["criteria"]) - 1)
+            if not lo <= v <= hi:
+                raise ValueError(
+                    f"jev: {name}.{field} is {v!r}, outside [{lo:g}, {hi:g}]")
 
 
 def _cache_path(state: str, requested: str) -> pathlib.Path:
@@ -252,17 +277,19 @@ def ask_meta(state: str, cache: bool = True) -> dict:
     """
     requested = model_name()
     path = _cache_path(state, requested) if cache else None
-    if path is not None and path.is_file() \
-            and time.time() - path.stat().st_mtime < CACHE_TTL:
+    if path is not None:
+        # OSError included, and the stat inside the try: one unreadable entry
+        # (bad mode, or a sibling pruning it between the stat and the read)
+        # otherwise raised on every dispatch of that task for the file's whole
+        # seven-day life, never refetching -- the same shape of bug the answer
+        # check above was added to fix, one layer out.
         try:
-            rec = json.loads(path.read_text())
-            # A bare answers object is the format before the model was kept.
-            if "answers" not in rec:
-                rec = {"answers": rec, "model": None}
-            check_answers(rec["answers"])
-            return {"answers": rec["answers"], "model": rec.get("model"),
-                    "requested": requested, "cached": True}
-        except (ValueError, TypeError, KeyError):
+            if path.is_file() and time.time() - path.stat().st_mtime < CACHE_TTL:
+                rec = json.loads(path.read_text())
+                check_answers(rec["answers"])
+                return {"answers": rec["answers"], "model": rec.get("model"),
+                        "requested": requested, "cached": True}
+        except (ValueError, TypeError, KeyError, OSError):
             pass  # unreadable or incomplete: refetch rather than serve it
 
     resp = system_one(state, QUESTIONS, model=requested)
@@ -270,8 +297,13 @@ def ask_meta(state: str, cache: bool = True) -> dict:
     check_answers(answers)
     model = resp.get("model")
     if path is not None:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"model": model, "answers": answers}))
+        # An answer already fetched, validated and paid for is not worth
+        # throwing away because the cache dir is unwritable.
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"model": model, "answers": answers}))
+        except OSError:
+            pass
     return {"answers": answers, "model": model, "requested": requested,
             "cached": False}
 

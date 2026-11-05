@@ -14,7 +14,7 @@ schema 2 keeps Jev's raw answer: without the level probabilities a new gate
 could only ever be judged on new traffic, one dispatch at a time.
 
 **This changes no routing.** It is the measuring instrument, not the policy.
-Nothing imports it except explain.py, for an extra column.
+It is imported by explain.py, for an extra column, and by selftest_route.py.
 
 ## The gate being replayed
 
@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 import sys
 
@@ -71,13 +72,15 @@ UP_BAR = 0.50
 SUM_TOLERANCE = 0.025
 
 
-def level_probs(answer: dict, levels: int) -> list[float] | None:
+def level_probs(answer: object, levels: int) -> list[float] | None:
     """Renormalised level probabilities, or None if they cannot be trusted.
 
     None rather than a guess: every caller treats it as "hold at the parent
     tier", because a gate fed a distribution it does not understand should
     decline rather than act on the part it does.
     """
+    if not isinstance(answer, dict):
+        return None
     raw = answer.get("probabilities")
     if not isinstance(raw, dict):
         return None
@@ -86,11 +89,18 @@ def level_probs(answer: dict, levels: int) -> list[float] | None:
     # criteria `need_of` weights them by.
     if set(raw) != {str(i) for i in range(levels)}:
         return None
-    try:
-        p = [float(raw[str(i)]) for i in range(levels)]
-    except (TypeError, ValueError):
+    p = [raw[str(i)] for i in range(levels)]
+    # Numbers, not things float() would accept. check_answers refuses a number
+    # sent as a string on the live path, and two readers of one wire format
+    # that disagree about what it is are worse than either rule alone.
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in p):
         return None
-    if any(v < 0 for v in p):
+    # isfinite first, and in the same test as the sign: every comparison
+    # against NaN is False, so a NaN level used to pass the sign check *and*
+    # the sum check below, and arrive at rung_of as a need that falls through
+    # both lines to the cheapest rung. json.load parses a bare NaN token by
+    # default, so one can reach here straight off the wire.
+    if not all(math.isfinite(v) and v >= 0 for v in p):
         return None
     total = sum(p)
     if abs(total - 1.0) > SUM_TOLERANCE or total <= 0:
@@ -113,14 +123,23 @@ def rung_probs(answers: dict, tiers: list[str]) -> dict[str, float] | None:
     `mechanical` stays a point value. It shifts every cell by the same amount,
     so it moves the lines rather than spreading the mass.
     """
+    if not isinstance(answers, dict):
+        return None
     d_levels = len(policy.QUESTIONS["depth"]["criteria"])
     b_levels = len(policy.QUESTIONS["breadth"]["criteria"])
-    pd = level_probs(answers.get("depth") or {}, d_levels)
-    pb = level_probs(answers.get("breadth") or {}, b_levels)
+    pd = level_probs(answers.get("depth"), d_levels)
+    pb = level_probs(answers.get("breadth"), b_levels)
     if pd is None or pb is None:
         return None
-    mech = (answers.get("mechanical") or {}).get("noul")
-    if isinstance(mech, bool) or not isinstance(mech, (int, float)):
+    mech_answer = answers.get("mechanical")
+    if not isinstance(mech_answer, dict):
+        return None
+    mech = mech_answer.get("noul")
+    if isinstance(mech, bool) or not isinstance(mech, (int, float)) \
+            or not math.isfinite(mech):
+        # A NaN here is the worst of the malformed shapes: it makes every one
+        # of the 25 cells fall through rung_of to the cheapest rung, so the
+        # tool reports a confident point mass on haiku with no nan in sight.
         return None
 
     out = {t: 0.0 for t in tiers}
@@ -146,8 +165,10 @@ def summed_gate(probs: dict, default: str, tiers: list[str], avail: list[str],
     cumulative mass clears tau, so a confident answer saves as much as it has
     earned rather than one rung at a time.
 
-    With tau and up_bar both >= 0.5 the two rules cannot both fire: the mass
-    they ask for would have to overlap.
+    With tau and up_bar both > 0.5 the two rules cannot both fire: the mass
+    they ask for would have to overlap. At exactly 0.5 they can -- a
+    distribution split cleanly in half satisfies both -- and the upgrade is
+    checked first, so that is what wins. Erring dear is the safe direction.
     """
     here = tiers.index(default)
 
@@ -164,6 +185,7 @@ def summed_gate(probs: dict, default: str, tiers: list[str], avail: list[str],
     # Downgrade: the cheapest rung r below the parent with P(rung <= r) >= tau.
     acc = 0.0
     missed = ""
+    gap = float("inf")
     for t in tiers:
         acc += probs[t]
         if tiers.index(t) >= here:
@@ -175,11 +197,15 @@ def summed_gate(probs: dict, default: str, tiers: list[str], avail: list[str],
             # being unavailable never moves the probabilities.
             return (policy.nearest_tier(t, avail, tiers),
                     f"P(<= {t}) {acc:.3f} >= {bar:g}")
-        # The closest the answer came. Overwritten each rung, so what survives
-        # is the dearest one tried -- the largest cumulative mass, and so the
-        # near miss worth reading. A bare "held" next to a tau sweep says
-        # nothing about whether the bar missed by 0.002 or by 0.6.
-        missed = f"P(<= {t}) {acc:.3f} < {bar:g}"
+        # The closest the answer came, kept by how far it fell short rather
+        # than by which rung came last. Under one global bar those agree, but
+        # per transition they do not: a 0.01 miss at opus>haiku and a 0.30
+        # miss at opus>sonnet would otherwise report the 0.30. A bare "held"
+        # next to a tau sweep says nothing about whether the bar missed by
+        # 0.002 or by 0.6.
+        if bar - acc < gap:
+            gap = bar - acc
+            missed = f"P(<= {t}) {acc:.3f} < {bar:g}"
 
     return default, f"held at {default}" + (f": {missed}" if missed else "")
 
@@ -199,6 +225,17 @@ def replay_one(rec: dict, taus: dict, up_bar: float) -> dict:
         if rec.get("why"):
             return {"skip": "no decision was made"}
         return {"skip": "schema 1: no answer kept"}
+
+    # The hash is recorded for exactly this: policy.QUESTIONS_HASH says two
+    # records scored by the same questions can be compared and two scored by
+    # different ones cannot. Reword one criterion without changing how many
+    # there are and level_probs still accepts the answer, while `need_of` now
+    # weights those probabilities by criteria the scorer never saw. That is
+    # the one edit the level count cannot catch, and the retention window is
+    # long enough to straddle it.
+    if jev.get("questions") != policy.QUESTIONS_HASH:
+        return {"skip": f"scored under question set {jev.get('questions')!r}, "
+                        f"not {policy.QUESTIONS_HASH!r}"}
 
     try:
         prov = providers.get(rec.get("provider") or providers.DEFAULT)
@@ -294,6 +331,29 @@ def sweep(recs: list[dict], up_bar: float) -> None:
         print(f"{tau:>6.2f} {down:>11} {differ:>8}  {len(rs)}")
 
 
+def known_tiers() -> dict[str, list[str]]:
+    """Every ladder a logged record could have been decided on, by provider."""
+    return {name: providers.get(name).TIERS for name in providers.KNOWN}
+
+
+def a_bar(value: str, what: str) -> float:
+    """A probability bar, refused unless it is one.
+
+    Both gates accumulate before testing and test inclusively, so a bar of 0
+    is cleared by the first rung examined -- the dearest for the upgrade, the
+    cheapest for the downgrade. `--up-bar 0` reads as "no bar on upgrades" and
+    would do the exact opposite: route every record to the dearest rung on no
+    evidence at all.
+    """
+    try:
+        bar = float(value)
+    except ValueError as e:
+        raise SystemExit(f"{what} {value!r}: not a number") from e
+    if not math.isfinite(bar) or not 0 < bar <= 1:
+        raise SystemExit(f"{what} {value!r}: a probability bar, in (0, 1]")
+    return bar
+
+
 def parse_tau(values: list[str]) -> dict:
     """`0.85`, or `opus>haiku=0.95`, repeatable. Global default under "*".
 
@@ -301,16 +361,31 @@ def parse_tau(values: list[str]) -> dict:
     a capable model, opus -> haiku is the one that produces a confident wrong
     answer, and one bar for both prices them as though they were equal.
     """
+    ladders = known_tiers()
     taus = {"*": TAU}
     for v in values:
-        if "=" in v:
-            where, _, num = v.partition("=")
-            frm, sep, to = where.partition(">")
-            if not sep:
-                raise SystemExit(f"--tau {v!r}: expected 'from>to=value'")
-            taus[(frm.strip(), to.strip())] = float(num)
-        else:
-            taus["*"] = float(v)
+        if "=" not in v:
+            taus["*"] = a_bar(v, "--tau")
+            continue
+        where, _, num = v.partition("=")
+        frm, sep, to = where.partition(">")
+        if not sep:
+            raise SystemExit(f"--tau {v!r}: expected 'from>to=value'")
+        frm, to = frm.strip(), to.strip()
+        # A bar on a transition that can never be consulted is almost always a
+        # typo, and the table it produces is indistinguishable from one
+        # computed at the bar you meant -- which for a tool whose whole output
+        # is "what the bar did" is the worst way to be wrong.
+        ladder = next((t for t in ladders.values() if frm in t and to in t), None)
+        if ladder is None:
+            raise SystemExit(
+                f"--tau {v!r}: {frm!r} and {to!r} are not two rungs of one "
+                f"ladder ({'; '.join(' '.join(t) for t in ladders.values())})")
+        if ladder.index(to) >= ladder.index(frm):
+            raise SystemExit(
+                f"--tau {v!r}: only downgrades are gated, and {to!r} is not "
+                f"below {frm!r}")
+        taus[(frm, to)] = a_bar(num, "--tau")
     return taus
 
 
@@ -322,7 +397,8 @@ def main() -> None:
     p.add_argument("--tau", action="append", default=[], metavar="BAR",
                    help=f"downgrade bar: a number, or 'from>to=number'. "
                         f"Default {TAU}, and unmeasured")
-    p.add_argument("--up-bar", type=float, default=UP_BAR,
+    p.add_argument("--up-bar", type=lambda v: a_bar(v, "--up-bar"),
+                   default=UP_BAR,
                    help=f"upgrade bar on P(rung >= r). Default {UP_BAR}")
     p.add_argument("--sweep", action="store_true",
                    help="disagreement count against tau, instead of a table")
@@ -343,23 +419,36 @@ def main() -> None:
     picked = ([s["session"] for s in known] if args.all
               else [args.session or known[0]["session"]])
 
-    if args.json:
-        out = {s: [{k: v for k, v in r.items() if k != "rec"}
-                   for r in rows(decisions.read(s), taus, args.up_bar)]
-               for s in picked}
-        json.dump(out, sys.stdout, indent=2)
-        print()
-        return
-
     if args.sweep:
+        if args.tau:
+            # --sweep sets the bar itself, one line per value. Silently
+            # ignoring the bar you asked for would print a table that answers
+            # a different question than the one on the command line.
+            raise SystemExit("--sweep sets tau itself; drop --tau")
         every = [r for s in picked for r in decisions.read(s)]
         sweep(every, args.up_bar)
         return
 
+    if args.json:
+        out = {s: [{k: v for k, v in r.items() if k != "rec"}
+                   for r in rows(decisions.read(s), taus, args.up_bar)]
+               for s in picked}
+        # allow_nan=False: the default emits a bare NaN token, which is not
+        # JSON -- JSON.parse rejects it and jq silently reads it as null. If
+        # one ever reaches here the guards above have a hole, and an error is
+        # the right way to find out.
+        json.dump(out, sys.stdout, indent=2, allow_nan=False)
+        print()
+        return
+
     for s in picked:
         recs = decisions.read(s)
-        if recs:
-            show(s, recs, taus, args.up_bar)
+        if not recs:
+            # Distinct from an empty session: explain.py says the same thing
+            # rather than exiting 0 on a typo'd id.
+            print(f"no decisions recorded for session {s}")
+            continue
+        show(s, recs, taus, args.up_bar)
 
 
 if __name__ == "__main__":
