@@ -19,6 +19,7 @@
 
 import { test, expect } from 'claude-code/testing'
 import type { AgentSpawnInput, On } from 'claude-code'
+import { adviceLine, decisionLine } from '../hooks/register.js'
 
 const PARENT = 'claude-opus-5'
 const SESSION = 'sess_test'
@@ -48,6 +49,16 @@ function dispatch(over: Partial<AgentSpawnInput> = {}): AgentSpawnInput {
   }
 }
 
+// The signals Jev returned for this task, and the `need` the policy computes
+// from them: 0.60*(1.94/4) + 0.40*(3.02/4) - 0.25*0.88. Spelled out because a
+// fixture whose numbers do not satisfy need_of is a shape route.py cannot
+// emit, and a test built on one proves nothing about the real thing.
+const SIGNALS = {
+  depth: 1.94, breadth: 3.02, mechanical: 0.88,
+  irreversible: 0.09, ambiguous: 0.66,
+}
+const NEED = 0.373
+
 /** One element of the array route.py --json prints, with the keys it prints. */
 function decision(over: Record<string, unknown> = {}) {
   return JSON.stringify([{
@@ -55,20 +66,32 @@ function decision(over: Record<string, unknown> = {}) {
     task: STATE,
     model: 'sonnet',
     effort: 'medium',
-    need: 0.41,
+    need: NEED,
     conf: 0.82,
     suggested: 'sonnet',
     held: false,
     wanted: 'sonnet',
     tiers: ['haiku', 'sonnet', 'opus'],
-    // Both are on every successful decision route.py prints, and the mod reads
-    // them: `advice.confirm` is what raises the irreversible warning, and
-    // `signals.irreversible` is the number it quotes. A fixture without them
-    // is a shape route.py never emits.
+    // `advice` and `signals` are on every successful decision route.py
+    // prints, and the mod reads both: `advice.confirm` raises the irreversible
+    // warning and `signals.irreversible` is the number it quotes.
     advice: { confirm: false, clarify: false },
-    signals: {
-      depth: 1.94, breadth: 3.02, mechanical: 0.88,
-      irreversible: 0.09, ambiguous: 0.66,
+    signals: SIGNALS,
+    // So is `jev`, carrying the raw answer the decision log keeps. The mod
+    // never reads it; it is here so the fixture is a shape route.py emits
+    // rather than a subset someone assembled.
+    jev: {
+      model: 'jev-1.14.0',
+      requested: 'jev-1.14.0',
+      questions: '979664a4215b',
+      cached: false,
+      answers: {
+        depth: { type: 'score', score: 1.94, confidence: 0.82 },
+        breadth: { type: 'score', score: 3.02, confidence: 0.9 },
+        mechanical: { type: 'noul', noul: 0.88 },
+        irreversible: { type: 'noul', noul: 0.09 },
+        ambiguous: { type: 'noul', noul: 0.66 },
+      },
     },
     ...over,
   }])
@@ -171,11 +194,14 @@ test('an irreversible dispatch is warned about, not re-tiered', async ($, on) =>
   // confirmation step, and buying a bigger model answers none of it. On a
   // measured run an old `irreversible` floor sent "reformat this comment I
   // already wrote" straight to opus on this basis alone.
+  //
+  // Only `irreversible` moves from the base fixture: the other four signals
+  // are what produce its `need`, and a deploy being irreversible says nothing
+  // about how hard it is.
   const { spawned } = stub(on, {
     stdout: decision({
       advice: { confirm: true, clarify: false },
-      signals: { depth: 1.2, breadth: 0.8, mechanical: 0.9,
-        irreversible: 0.94, ambiguous: 0.3 },
+      signals: { ...SIGNALS, irreversible: 0.94 },
     }),
   })
 
@@ -184,6 +210,46 @@ test('an irreversible dispatch is warned about, not re-tiered', async ($, on) =>
   // sonnet because the score earned it, not because of the advice: the
   // fixture's own model field is unchanged by the warning.
   expect(spawned).toEqual(['sonnet'])
+})
+
+test('the irreversible warning says so, and quotes the score', () => {
+  // Asserted on the text, not through the hook. The only thing `agent.spawn`
+  // exposes is the model the dispatch ran on, and not moving it is the whole
+  // point of this line -- so a test driven through the hook passes equally
+  // well if the warning is never printed at all.
+  const plan = { advice: { confirm: true }, signals: { irreversible: 0.94 } }
+
+  expect(adviceLine(plan, LABEL, true)).toBe(
+    `${LABEL} -- irreversible 0.94: writes outside the working tree. ` +
+    'Tier unchanged; this is a warning, not a gate.')
+  expect(adviceLine({ advice: { confirm: false } }, LABEL, true)).toBeNull()
+})
+
+test('the warning does not claim the tier is unchanged under a re-tier', () => {
+  // decisionLine prints first. An irreversible dispatch usually scores high on
+  // `mechanical`, which is exactly what earns a downgrade, so "opus -> sonnet"
+  // followed by "Tier unchanged" is the common pairing rather than a corner
+  // case. The clause belongs only to the line that stands alone.
+  const plan = {
+    model: 'sonnet', need: NEED, conf: 0.82, wanted: 'sonnet',
+    suggested: 'sonnet', held: false,
+    advice: { confirm: true }, signals: { irreversible: 0.94 },
+  }
+  const decided = decisionLine(plan, 'opus', LABEL)
+
+  expect(decided).toBe(`${LABEL} -- opus -> sonnet (need 0.37, conf 0.82)`)
+  expect(adviceLine(plan, LABEL, !decided)).toBe(
+    `${LABEL} -- irreversible 0.94: writes outside the working tree.`)
+})
+
+test('a plan route.py could not decide produces no line and no throw', () => {
+  // The failure shape: route_one's except branch sets `why` and nothing else,
+  // so neither builder may reach a number on it.
+  const failed = { model: 'opus', effort: 'high', why: 'jev error: 503' }
+
+  expect(decisionLine(failed, 'opus', LABEL)).toBe(
+    `${LABEL} -- not routed: jev error: 503`)
+  expect(adviceLine(failed, LABEL, false)).toBeNull()
 })
 
 test('a fork is never priced', async ($, on) => {
