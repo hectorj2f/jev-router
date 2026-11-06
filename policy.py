@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import pathlib
 import sys
 import time
+import types
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from jev import system_one  # noqa: E402
+import providers  # noqa: E402
+from jev import model_name, system_one  # noqa: E402
 
 CACHE_DIR = pathlib.Path(__file__).parent / "cache"
 CACHE_TTL = 7 * 24 * 3600
@@ -79,27 +82,42 @@ QUESTIONS = {
     },
 }
 
-# Fable is deliberately NOT in the ladder. The /model picker flags it as
-# "Requires usage credits" on some plans, and in -p mode Claude Code bills it
-# without asking -- not something a router should reach for on its own.
-TIERS = ["haiku", "sonnet", "opus"]
+# Which rungs exist, what they are called on the wire, and what effort each
+# takes are the host's business, not the policy's (see providers/). Bound at
+# module scope so that `policy.TIERS` stays the name every front end reads.
+PROVIDER = providers.current()
+TIERS = PROVIDER.TIERS
+EFFORT = PROVIDER.EFFORT
 
-# Haiku 4.5 is absent from Claude Code's effort-level table, so passing
-# --effort alongside it is an error rather than a no-op.
-EFFORT = {"haiku": None, "sonnet": "medium", "opus": "high"}
-
+# Measured against Claude's ladder, and named for the rungs they were measured
+# on, but what they mark is a position on a three-rung ladder rather than a
+# model: route.py plots them by these names, so they keep them.
 OPUS_LINE = 0.60
 SONNET_LINE = 0.25
 
 
-def available_tiers() -> list[str]:
+def _tiers_file(prov: types.ModuleType) -> pathlib.Path:
+    """Where `prov`'s probe record lives.
+
+    Per provider, because a ladder measured against one host says nothing
+    about the other. The unsuffixed name stays readable for claude: probe.py
+    writes cache/tiers.json, and the measurement already on disk is in it.
+    """
+    per_provider = CACHE_DIR / f"tiers-{prov.NAME}.json"
+    if per_provider.is_file() or prov.NAME != "claude":
+        return per_provider
+    return CACHE_DIR / "tiers.json"
+
+
+def available_tiers(provider: types.ModuleType | None = None) -> list[str]:
     """The tiers this machine can actually serve, cheapest first.
 
     Routing to a model the endpoint does not have is worse than not routing:
     the dispatch dies on a 404 instead of running on the model it would have
     used, and the hook cannot catch that -- it happens after the hook returns.
 
-    JEV_TIERS wins; otherwise this reads what `./probe.py` measured. There was
+    JEV_TIERS wins, then a provider that can answer for itself (codex), then
+    what `./probe.py` measured. There was
     an inference here once -- "pinned in the environment, therefore served" --
     and it was wrong in the expensive direction: a Vertex project pinned
     ANTHROPIC_DEFAULT_SONNET_MODEL to a model it had never been granted, so the
@@ -107,27 +125,46 @@ def available_tiers() -> list[str]:
     file, assume the full ladder rather than guess a narrower one, and let the
     first dead dispatch send you to probe.py.
     """
+    prov = provider if provider is not None else PROVIDER
+    ladder = prov.TIERS
+
     explicit = os.environ.get("JEV_TIERS", "").strip()
     if explicit:
         want = {t.strip() for t in explicit.split(",")}
-        return [t for t in TIERS if t in want] or list(TIERS)
+        return [t for t in ladder if t in want] or list(ladder)
+
+    # A provider that can answer this itself beats a probe record: codex-cli
+    # caches the catalogue its own account was granted, so the measurement is
+    # already on disk and as current as the last `codex` run, where probe.py's
+    # is as current as whenever someone last remembered to run it. None means
+    # no catalogue could be read, which falls through to the same places an
+    # unprobed Claude does; an empty list is a real measurement and is
+    # returned as one.
+    own = getattr(prov, "served", None)
+    if own is not None:
+        got = own()
+        if got is not None:
+            return got
 
     try:
-        rec = json.loads((CACHE_DIR / "tiers.json").read_text())
+        rec = json.loads(_tiers_file(prov).read_text())
         recorded, resolved = rec["tiers"], rec.get("resolved", {})
     except (OSError, json.JSONDecodeError, KeyError):
-        return list(TIERS)
+        return list(ladder)
 
     out = []
-    for t in TIERS:
+    for t in ladder:
         if t not in recorded:
             continue
         # The probe measured one specific model ID. If the environment now
         # points this alias somewhere else, that measurement is about a
         # different model and says nothing about the one that would be used.
+        # A provider with no alias to repoint (codex) has nothing that can go
+        # stale this way: it emits the literal slug the probe measured.
+        alias = prov.alias_env(t)
         was = resolved.get(t)
-        if was and was != "(built-in default)" and \
-                os.environ.get(f"ANTHROPIC_DEFAULT_{t.upper()}_MODEL") != was:
+        if alias and was and was != "(built-in default)" and \
+                os.environ.get(alias) != was:
             continue
         out.append(t)
     # Deliberately NOT `or list(TIERS)`. A record that yields nothing -- empty,
@@ -140,43 +177,158 @@ def available_tiers() -> list[str]:
     return out
 
 
-def nearest_tier(tier: str, avail: list[str]) -> str:
+def need_of(depth: float, breadth: float, mechanical: float) -> float:
+    """How much model the work wants, from three signals already in [0, 1].
+
+    A function rather than a line inside decide() because replay.py evaluates
+    it once per (depth, breadth) level pair to get a distribution over rungs.
+    Two copies of these weights would be two policies the moment either moved.
+    """
+    return 0.60 * depth + 0.40 * breadth - 0.25 * mechanical
+
+
+def rung_of(need: float, tiers: list[str]) -> str:
+    """Which rung a `need` falls in. The two lines, in one place."""
+    cheap, mid, dear = tiers
+    return dear if need >= OPUS_LINE else mid if need >= SONNET_LINE else cheap
+
+
+def nearest_tier(tier: str, avail: list[str], ladder: list[str] | None = None) -> str:
     """`tier` if it is served, else the next one up. Never silently cheaper."""
-    for t in TIERS[TIERS.index(tier):]:
+    ladder = ladder if ladder is not None else TIERS
+    for t in ladder[ladder.index(tier):]:
         if t in avail:
             return t
     return avail[-1] if avail else tier
 
 
-def ask(state: str, cache: bool = True) -> dict:
-    """Jev's raw answers for one task, memoized on disk by the task text.
+# Which question set a logged answer was given to. Short because it is a label
+# rather than a security property: two records with the same hash were scored
+# by the same questions and can be compared, and two with different ones cannot.
+QUESTIONS_HASH = hashlib.sha256(
+    json.dumps(QUESTIONS, sort_keys=True).encode()).hexdigest()[:12]
 
-    The status line re-runs on every assistant message, and the hooks can see
-    the same task more than once, so an uncached call here would mean a request
-    per redraw.
+# The fields each answer type has to carry for decide() to read it, and the
+# range each has to be in. None means "0 to the last index of this question's
+# own criteria list", which only a score has.
+_NUMERIC = {
+    "score": (("score", None), ("confidence", (0.0, 1.0))),
+    "noul": (("noul", (0.0, 1.0)),),
+    "choice": (("confidence", (0.0, 1.0)),),
+}
+
+
+def check_answers(answers, questions: dict = QUESTIONS) -> None:
+    """Raise ValueError unless every question got an answer decide() can read.
+
+    Checked before anything is cached, because the cache keeps what it is given
+    for a week: an answer missing a field used to be stored, then raise KeyError
+    inside decide() on every dispatch of that task until it expired.
+
+    Range and finiteness are part of "can read", not pedantry. Both lines in
+    rung_of are `>=` comparisons, and every comparison against NaN is False, so
+    a NaN need falls through to the *cheapest* rung with no error anywhere --
+    json.load parses a bare NaN token by default, so it arrives this far. An
+    out-of-range noul is as bad in the other direction: mechanical = 7.0 gives
+    need = -0.75 and clears the `> 0.75` downgrade gate at the same time.
     """
-    if not cache:
-        return system_one(state, QUESTIONS)["answers"]
+    if not isinstance(answers, dict):
+        raise ValueError(f"jev: answers is {type(answers).__name__}, not an object")
+    for name, q in questions.items():
+        a = answers.get(name)
+        if not isinstance(a, dict) or a.get("type") != q["type"]:
+            raise ValueError(f"jev: no {q['type']} answer for {name!r}")
+        if q["type"] not in _NUMERIC:
+            # Presence-only was the silent default here, in a function whose
+            # whole promise is that decide() can read what survives it.
+            raise ValueError(f"jev: {name!r} has unchecked type {q['type']!r}; "
+                             f"teach check_answers about it before asking it")
+        for field, bounds in _NUMERIC[q["type"]]:
+            v = a.get(field)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"jev: {name}.{field} is {v!r}, not a number")
+            if not math.isfinite(v):
+                raise ValueError(f"jev: {name}.{field} is {v!r}, not finite")
+            lo, hi = bounds or (0, len(q["criteria"]) - 1)
+            if not lo <= v <= hi:
+                raise ValueError(
+                    f"jev: {name}.{field} is {v!r}, outside [{lo:g}, {hi:g}]")
 
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cache_path(state: str, requested: str) -> pathlib.Path:
     # The questions are part of the key, not just the state. Keying on the state
-    # alone means editing QUESTIONS silently serves answers to the old ones.
-    key = json.dumps([state, QUESTIONS], sort_keys=True).encode()
-    path = CACHE_DIR / (hashlib.sha256(key).hexdigest()[:32] + ".json")
-    if path.is_file() and time.time() - path.stat().st_mtime < CACHE_TTL:
+    # alone means editing QUESTIONS silently serves answers to the old ones. The
+    # requested model is part of it for the same reason: a week-old answer from
+    # one version of Jev is not an answer from the version now pinned.
+    key = json.dumps([state, QUESTIONS, requested], sort_keys=True).encode()
+    return CACHE_DIR / (hashlib.sha256(key).hexdigest()[:32] + ".json")
+
+
+def ask_meta(state: str, cache: bool = True) -> dict:
+    """Jev's raw answers for one task, with which Jev gave them.
+
+    Returns {"answers", "model", "requested", "cached"}. `model` is the version
+    the response says answered, which is not necessarily `requested`: an alias
+    such as jev-latest resolves server-side, and only the response says to what.
+
+    Memoized on disk by task text, question set and requested model. The hooks
+    can see the same task more than once, so an uncached call here would mean a
+    request per sighting.
+    """
+    requested = model_name()
+    path = _cache_path(state, requested) if cache else None
+    if path is not None:
+        # OSError included, and the stat inside the try: one unreadable entry
+        # (bad mode, or a sibling pruning it between the stat and the read)
+        # otherwise raised on every dispatch of that task for the file's whole
+        # seven-day life, never refetching -- the same shape of bug the answer
+        # check above was added to fix, one layer out.
         try:
-            return json.loads(path.read_text())
-        except json.JSONDecodeError:
-            pass  # fall through and refetch
+            if path.is_file() and time.time() - path.stat().st_mtime < CACHE_TTL:
+                rec = json.loads(path.read_text())
+                check_answers(rec["answers"])
+                return {"answers": rec["answers"], "model": rec.get("model"),
+                        "requested": requested, "cached": True}
+        except (ValueError, TypeError, KeyError, OSError):
+            pass  # unreadable or incomplete: refetch rather than serve it
 
-    answers = system_one(state, QUESTIONS)["answers"]
-    path.write_text(json.dumps(answers))
-    return answers
+    resp = system_one(state, QUESTIONS, model=requested)
+    answers = resp.get("answers") if isinstance(resp, dict) else None
+    check_answers(answers)
+    model = resp.get("model")
+    if path is not None:
+        # An answer already fetched, validated and paid for is not worth
+        # throwing away because the cache dir is unwritable.
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"model": model, "answers": answers}))
+        except OSError:
+            pass
+    return {"answers": answers, "model": model, "requested": requested,
+            "cached": False}
 
 
-def decide(ans: dict, default: str = "sonnet", tiers: list[str] | None = None) -> dict:
-    """Turn Jev's answers into a tier, applying the asymmetric gates."""
-    avail = tiers if tiers is not None else available_tiers()
+def ask(state: str, cache: bool = True) -> dict:
+    """Jev's raw answers for one task. See ask_meta for which Jev gave them."""
+    return ask_meta(state, cache=cache)["answers"]
+
+
+def decide(ans: dict, default: str | None = None, tiers: list[str] | None = None,
+           provider: types.ModuleType | None = None) -> dict:
+    """Turn Jev's answers into a tier, applying the asymmetric gates.
+
+    `default` is the tier the caller is already on. It defaults to the middle
+    rung, which on Claude is the "sonnet" every existing caller that omits it
+    meant; naming it by position is what lets the same call work on a ladder
+    with no sonnet on it.
+    """
+    prov = provider if provider is not None else PROVIDER
+    # Unpacking rather than indexing: the two lines below cut a ladder into
+    # three, so a provider that offered four rungs would be silently routed as
+    # if it had three. Fail where the assumption is, not two frames later.
+    cheap, mid, dear = prov.TIERS
+    default = default if default is not None else mid
+    avail = tiers if tiers is not None else available_tiers(prov)
     # Nothing known to be serviceable: the one model we can be sure this
     # endpoint serves is the one the session is already running on. Clamping to
     # it makes every decision a no-op rather than a guess.
@@ -192,10 +344,10 @@ def decide(ans: dict, default: str = "sonnet", tiers: list[str] | None = None) -
     # near-constant +0.20 against a 0.25 haiku line. That reading is not wrong --
     # a conversational prompt genuinely is under-specified -- it is just the
     # wrong response to it. See `advice` below.
-    need = 0.60 * depth + 0.40 * breadth - 0.25 * mechanical
+    need = need_of(depth, breadth, mechanical)
 
-    wanted = "opus" if need >= OPUS_LINE else "sonnet" if need >= SONNET_LINE else "haiku"
-    suggested = nearest_tier(wanted, avail)
+    wanted = rung_of(need, prov.TIERS)
+    suggested = nearest_tier(wanted, avail, prov.TIERS)
 
     # An upgrade is ungated: if `need` clears the bar, take it, even when Jev is
     # unsure. Measured over ten real tasks, a confidence floor on the upgrade did
@@ -208,16 +360,16 @@ def decide(ans: dict, default: str = "sonnet", tiers: list[str] | None = None) -
     # A downgrade still has to be earned. `mechanical` is the sharper of the two
     # signals that can earn it -- a two-outcome question, so its distribution is
     # not diffused across levels the way a 5-level score's is.
-    if TIERS.index(suggested) > TIERS.index(default):
+    if prov.TIERS.index(suggested) > prov.TIERS.index(default):
         model = suggested
-    elif TIERS.index(suggested) < TIERS.index(default):
+    elif prov.TIERS.index(suggested) < prov.TIERS.index(default):
         model = suggested if (mechanical > 0.75 or conf >= 0.70) else default
     else:
         model = default
 
     return {
         "model": model,
-        "effort": EFFORT[model],
+        "effort": prov.EFFORT[model],
         "need": round(need, 3),
         "conf": round(conf, 3),
         "suggested": suggested,
@@ -247,62 +399,51 @@ def decide(ans: dict, default: str = "sonnet", tiers: list[str] | None = None) -
     }
 
 
-def route(state: str, default: str = "sonnet", cache: bool = True) -> dict:
-    return decide(ask(state, cache=cache), default=default)
+def route(state: str, default: str | None = None, cache: bool = True) -> dict:
+    """decide() over a fresh or cached answer, carrying the answer with it.
+
+    The raw answer rides along under `jev` so the decision log keeps what was
+    measured, not only what was concluded from it. Without the full level
+    probabilities a different gate cannot be replayed over past dispatches, and
+    every threshold change would have to be judged on new traffic only.
+    """
+    meta = ask_meta(state, cache=cache)
+    plan = decide(meta["answers"], default=default)
+    plan["jev"] = {
+        "model": meta["model"],
+        "requested": meta["requested"],
+        "questions": QUESTIONS_HASH,
+        "cached": meta["cached"],
+        # The legend repeats QUESTIONS' own criteria text on every answer, and
+        # the hash above already says which criteria those were.
+        "answers": {name: {k: v for k, v in a.items() if k != "legend"}
+                    for name, a in meta["answers"].items()},
+    }
+    return plan
+
+
+def _reader(name: str):
+    """A provider's transcript reader, or a failure that names who lacks one.
+
+    A wrapper rather than `session_tier = PROVIDER.session_tier`, because that
+    assignment makes the name disappear from this module under a provider that
+    has no transcript to read, and hook_agent.py calls it unconditionally. The
+    hook fails open on either error; what differs is whether the traceback
+    names the provider that lacks the reader or just this file.
+    """
+    fn = getattr(PROVIDER, name, None)
+    if fn is None:
+        raise NotImplementedError(
+            f"provider {PROVIDER.NAME!r} has no {name}: it reads a Claude Code "
+            f"transcript, and nothing else writes one")
+    return fn
 
 
 def session_tier(transcript_path: str, lookback: int = 200) -> str | None:
-    """The tier the session is actually running on, from its last assistant turn.
-
-    This is what `default` has to be for a subagent: a dispatch inherits the
-    session model, so routing against a hardcoded "sonnet" in an opus session
-    makes every sonnet-grade task look like "no change" and skip the downgrade
-    gate entirely. Returns None for a model outside the ladder (fable) so the
-    caller can decline to route rather than guess.
-    """
-    try:
-        lines = pathlib.Path(transcript_path).read_text(errors="replace").splitlines()
-    except OSError:
-        return None
-
-    for line in reversed(lines[-lookback:]):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("type") != "assistant":
-            continue
-        model = entry.get("message", {}).get("model") or ""
-        for tier in TIERS:
-            if tier in model:
-                return tier
-        return None  # a known assistant turn on something off-ladder
-    return None
+    """The tier the session is running on -- see the provider for the why."""
+    return _reader("session_tier")(transcript_path, lookback)
 
 
 def last_user_prompt(transcript_path: str, lookback: int = 400) -> str | None:
-    """The most recent real user turn in a transcript.
-
-    Tool results, meta turns, sidechains, and the wrappers Claude Code writes
-    around slash commands all arrive as `type: "user"` too, so they have to go.
-    """
-    try:
-        lines = pathlib.Path(transcript_path).read_text(errors="replace").splitlines()
-    except OSError:
-        return None
-
-    for line in reversed(lines[-lookback:]):
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("type") != "user" or entry.get("isMeta") or entry.get("isSidechain"):
-            continue
-        content = entry.get("message", {}).get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        if content.lstrip().startswith(("<command-name>", "<local-command-",
-                                        "<command-message>", "<system-reminder>")):
-            continue
-        return content
-    return None
+    """The most recent real user turn -- see the provider for the why."""
+    return _reader("last_user_prompt")(transcript_path, lookback)

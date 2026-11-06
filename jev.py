@@ -21,6 +21,8 @@ Questions file is the `questions` map from the API docs, e.g.
 from __future__ import annotations
 
 import argparse
+import datetime
+import email.utils
 import json
 import os
 import pathlib
@@ -39,6 +41,31 @@ STATE_CHAR_LIMIT = 100_000
 
 RETRYABLE = {429, 529}
 
+# Pinned rather than "jev-latest". A threshold is tuned against one version of
+# the scorer, and "latest" moves under it without saying so: the policy here
+# was tuned in October 2026, the JEV-as-a-Judge study (arXiv 2609.26550) ran on
+# 1.13.0, and by 5 November the API was answering as 1.14.0. The study measures
+# nothing across versions -- what it does report is that a threshold does not
+# transfer between workloads, which is the same argument one step out: a number
+# fitted against one scorer is evidence about that scorer. So a version change
+# is a decision someone makes, on purpose, with JEV_MODEL -- and if the pinned
+# version is ever retired, the router stops routing and says why in the
+# decision log, rather than carrying on with numbers that mean something else.
+DEFAULT_MODEL = "jev-1.14.0"
+
+# The whole call, retries included, has to finish inside the caller's budget.
+# install.py registers both hooks at timeout 8 and hooks/register.js caps
+# route.py at 6s; past that the host kills the process mid-flight, so
+# decisions.record() is never reached and the outage is never logged -- the
+# one failure this module exists to make visible. An attempt count alone does
+# not bound that: five attempts at a 30s timeout plus 15s of backoff is 165s
+# worst case. So the ladder is bounded by wall clock and gives up out loud.
+BUDGET = 5.0
+
+
+def model_name() -> str:
+    return os.environ.get("JEV_MODEL", "").strip() or DEFAULT_MODEL
+
 
 def api_key() -> str:
     key = os.environ.get("TYPESAFE_API_KEY")
@@ -51,10 +78,49 @@ def api_key() -> str:
     )
 
 
+def retry_after(header: str | None, fallback: float) -> float:
+    """Seconds to wait, from either form of Retry-After RFC 9110 allows.
+
+    The date form used to reach `float()` and raise ValueError from inside the
+    HTTPError handler, where the sibling `except ValueError` could not catch
+    it: an exception raised in one handler is not offered to another on the
+    same try. It failed open, but logged as a jev-router bug rather than as
+    the API asking us to back off.
+    """
+    if not header:
+        return fallback
+    try:
+        return max(0.0, float(header))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return fallback
+    # A date with no zone is UTC per RFC 9110; without this the subtraction
+    # below raises on the naive/aware mix.
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - datetime.datetime.now(datetime.timezone.utc))
+               .total_seconds())
+
+
 def system_one(
-    state, questions: dict, model: str = "jev-latest", timeout: float = 30.0
+    state, questions: dict, model: str | None = None, timeout: float = 30.0,
+    budget: float = BUDGET,
 ) -> dict:
-    """One POST to /v1/systemone, with backoff on the two retryable statuses."""
+    """One POST to /v1/systemone, with backoff on the two retryable statuses.
+
+    Every failure leaves as SystemExit carrying a message, so a caller has one
+    thing to catch. That used to be true only of HTTP errors: a refused
+    connection, a timeout or a body that was not JSON escaped as their own
+    exceptions, and route.py's fan-out lost every shard to one of them.
+
+    `budget` bounds the whole call, retries and sleeps included. Giving up
+    inside it is what lets the caller log the outage; being killed by the host
+    for overrunning is what used to make a rate-limited Jev invisible.
+    """
+    model = model or model_name()
     body = json.dumps({"state": state, "model": model, "questions": questions})
     req = urllib.request.Request(
         ENDPOINT,
@@ -66,10 +132,16 @@ def system_one(
         method="POST",
     )
 
+    deadline = time.monotonic() + budget
     delay = 1.0
     for attempt in range(5):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise SystemExit(f"jev: gave up after {budget:g}s")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            # Never wait longer than the budget has left: a single hung
+            # connection at the default 30s timeout outlives every caller.
+            with urllib.request.urlopen(req, timeout=min(timeout, left)) as resp:
                 return json.load(resp)
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")
@@ -77,9 +149,21 @@ def system_one(
                 # 401 missing/invalid key, 422 names the offending field.
                 raise SystemExit(f"jev: HTTP {e.code}: {detail}") from e
             # Honour retry-after when the response carries one.
-            wait = float(e.headers.get("retry-after") or delay)
+            wait = retry_after(e.headers.get("retry-after"), delay)
+            if time.monotonic() + wait >= deadline:
+                # Say which it was. "Rate limited and we cannot wait that
+                # long" is a capacity problem; "gave up" alone reads as ours.
+                raise SystemExit(
+                    f"jev: HTTP {e.code}, backing off {wait:g}s would exceed "
+                    f"the {budget:g}s budget") from e
             time.sleep(wait)
             delay *= 2
+        except (urllib.error.URLError, OSError) as e:
+            # Not retried: the hooks run against a few-second budget, and a
+            # network that refused once is not about to change its mind.
+            raise SystemExit(f"jev: unreachable: {e}") from e
+        except ValueError as e:  # json.JSONDecodeError is a ValueError
+            raise SystemExit(f"jev: response was not JSON: {e}") from e
     raise SystemExit("jev: unreachable")
 
 
@@ -107,7 +191,8 @@ def main() -> None:
     p.add_argument("--questions-file", help="JSON file holding the questions map")
     p.add_argument("--noul", action="append", default=[], metavar="KEY=INSTRUCTIONS",
                    help="add a noul question inline; repeatable")
-    p.add_argument("--model", default="jev-latest")
+    p.add_argument("--model", default=None,
+                   help=f"defaults to $JEV_MODEL, else {DEFAULT_MODEL}")
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--summary", action="store_true",
                    help="print one line per answer instead of the raw JSON")

@@ -33,6 +33,9 @@ const ROUTE_TIMEOUT_MS = 6_000
 // Vertex shells out to gcloud first.
 const PROBE_TIMEOUT_MS = 120_000
 
+// explain.py only reads a log off local disk.
+const EXPLAIN_TIMEOUT_MS = 10_000
+
 /** The tier a resolved model id belongs to, or null for one off the ladder. */
 function tierOf(model) {
   for (const tier of TIERS) if (String(model || '').includes(tier)) return tier
@@ -44,11 +47,20 @@ function tierOf(model) {
  *
  * Piped rather than passed as argv: route.py reads a JSON array on stdin, and
  * a 60k task description has no business on a command line.
+ *
+ * The session id goes down with it so route.py writes the decision to the log
+ * /jev-explain reads back. Recording on that side rather than this one means
+ * the held decisions are logged too -- they return early here, by design.
  */
-async function routeOne($, state, parent) {
+async function routeOne($, state, parent, label, session, dispatch) {
+  // `dispatch` is the spawn's tool_use_id, logged so an outcome found later can
+  // be joined to this decision by id rather than by a label that repeats.
+  // JSON.stringify drops it when undefined, which route.py reads as no id.
   const run = await $.process.run(
-    [`${$.plugin.root}/route.py`, '--default', parent, '--json'],
-    { stdin: JSON.stringify([{ id: 'spawn', task: state }]), timeoutMs: ROUTE_TIMEOUT_MS },
+    [`${$.plugin.root}/route.py`, '--default', parent, '--session', session,
+      '--json'],
+    { stdin: JSON.stringify([{ id: label, task: state, dispatch }]),
+      timeoutMs: ROUTE_TIMEOUT_MS },
   )
   if (run.exitCode !== 0) return null
   const routed = JSON.parse(run.stdout)
@@ -56,7 +68,7 @@ async function routeOne($, state, parent) {
 }
 
 /** The one line the decision is worth, or null when nothing was decided. */
-function decisionLine(plan, parent, label) {
+export function decisionLine(plan, parent, label) {
   // A Jev error reaches us as a routed shard on the default tier. Worth saying
   // out loud: otherwise a broken router and a quiet one look identical.
   if (plan.why) return `${label} -- not routed: ${plan.why}`
@@ -76,6 +88,48 @@ function decisionLine(plan, parent, label) {
   return null
 }
 
+/**
+ * The warning a dispatch that writes outside the tree is worth, or null.
+ *
+ * Exported, with decisionLine, so the tests can assert the text itself. Via
+ * `agent.spawn` alone the only observable is which model the dispatch ran on,
+ * which is by design the one thing these lines do not change -- so a test
+ * driven through the hook passes just as well when they return null.
+ *
+ * Separate from decisionLine because it is not about the tier, and printed
+ * even when that returns null: a dispatch the router agreed with is exactly
+ * the case where nothing is said today, and "deploy this" agreeing with opus
+ * is still a deploy.
+ *
+ * A line rather than a gate. The finding `irreversible` comes from says the
+ * response to it is a confirmation step, which needs `tool.check` to know
+ * which dispatch a tool call belongs to and whether it writes -- neither
+ * `agentId` nor `isReadOnly` is in the declarations that shipped, so built
+ * today it would prompt on every tool call in the session. Saying so at spawn
+ * costs nothing and needs nothing. It does NOT move the tier: a cheap model
+ * posting the right comment is fine, and buying a bigger one answers none of
+ * what the irreversibility is asking for.
+ *
+ * `clarify` is deliberately not here: `ambiguous` reads high on nearly
+ * everything (see the Findings section of the README), so a warning on it
+ * fires on nearly everything. It needs a threshold measured on dispatch
+ * prompts first.
+ *
+ * `alone` is whether this is the only line printed. The trailing clause says
+ * the warning did not move the tier, which contradicts itself when
+ * decisionLine has just announced a re-tier directly above -- and that is the
+ * common case, not a corner one: an irreversible dispatch usually scores high
+ * on `mechanical`, which is what earns the downgrade in the first place.
+ */
+export function adviceLine(plan, label, alone) {
+  if (!plan.advice?.confirm) return null
+  // policy.decide owns the threshold; this only reports what it concluded.
+  const score = plan.signals?.irreversible
+  const at = typeof score === 'number' ? ` ${score.toFixed(2)}` : ''
+  const not = alone ? ' Tier unchanged; this is a warning, not a gate.' : ''
+  return `${label} -- irreversible${at}: writes outside the working tree.${not}`
+}
+
 export function register(on) {
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -85,6 +139,10 @@ export function register(on) {
     await $.command.register({
       name: 'jev-route',
       description: 'Score one task by hand and show the whole decision',
+    })
+    await $.command.register({
+      name: 'jev-explain',
+      description: 'What the router decided this session, and why',
     })
     return next(e)
   })
@@ -113,11 +171,15 @@ export function register(on) {
       `Task:\n${e.prompt || ''}`,
     ].join('\n').slice(0, STATE_LIMIT)
 
+    const label = (e.description || e.subagentType || 'dispatch').slice(0, 48)
+
     // No .catch handler on this registration, deliberately. A hook that fails
     // before calling next is skipped and the spawn proceeds on the model it
     // would otherwise have used, which is already the behaviour we want; a
-    // handler would add a concept and change nothing. The try is here because
-    // a throw after a decision is made should also leave the dispatch alone.
+    // handler would add a concept and change nothing. The try covers the call
+    // to Jev; the two line builders below are outside it because neither can
+    // throw on a plan route.py emits -- decisionLine returns at `plan.why`
+    // before touching a number, and adviceLine is guarded by `advice?.confirm`.
     //
     // This is fail-open over our own code paths only. What protects the
     // dispatch from a tier the endpoint cannot serve is the ladder clamp in
@@ -125,15 +187,17 @@ export function register(on) {
     // hook has returned, where nothing can catch it.
     let plan = null
     try {
-      plan = await routeOne($, state, parent)
+      plan = await routeOne($, state, parent, label, String(await $.session.id()),
+        e.tool_use_id)
     } catch {
       return next(e)
     }
     if (!plan) return next(e)
 
-    const label = (e.description || e.subagentType || 'dispatch').slice(0, 48)
-    const line = decisionLine(plan, parent, label)
-    if (line) $.ui.log(line)
+    const decided = decisionLine(plan, parent, label)
+    for (const line of [decided, adviceLine(plan, label, !decided)]) {
+      if (line) $.ui.log(line)
+    }
     // Never a deny: a refusal surfaces to the parent as an Agent tool error,
     // and a router has no business failing a dispatch it was only asked to
     // price. An unroutable task runs on the model it was already going to use.
@@ -169,5 +233,20 @@ export function register(on) {
       { timeoutMs: ROUTE_TIMEOUT_MS })
     const out = `${run.stdout}${run.stderr}`.trim()
     return { text: out || `route.py exited ${run.exitCode} and said nothing` }
+  })
+
+  on('command.run', { command: 'jev-explain' }, async ($, e) => {
+    // Pinned to this session unless the user named another one. Left to itself
+    // explain.py takes the most recently written log, which is the right guess
+    // from a shell and the wrong one here: a second Claude running alongside
+    // would have written more recently than the session asking the question.
+    const argv = [`${$.plugin.root}/explain.py`,
+      ...String(e.args || '').trim().split(/\s+/).filter(Boolean)]
+    if (!argv.includes('--sessions') && !argv.includes('--session')) {
+      argv.push('--session', String(await $.session.id()))
+    }
+    const run = await $.process.run(argv, { timeoutMs: EXPLAIN_TIMEOUT_MS })
+    const out = `${run.stdout}${run.stderr}`.trim()
+    return { text: out || `explain.py exited ${run.exitCode} and said nothing` }
   })
 }

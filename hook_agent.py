@@ -16,6 +16,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import decisions  # noqa: E402
 import policy  # noqa: E402
 
 STATE_LIMIT = 60_000
@@ -39,10 +40,31 @@ def main() -> None:
     if default is None:
         return  # unreadable, or off-ladder (fable): decline rather than guess
 
-    state = (f"Agent type: {ti.get('subagent_type') or 'general-purpose'}\n"
+    agent = ti.get("subagent_type") or "general-purpose"
+    state = (f"Agent type: {agent}\n"
              f"Description: {ti.get('description') or ''}\n"
              f"Task:\n{ti.get('prompt') or ''}")
-    plan = policy.route(state[:STATE_LIMIT], default=default)
+    session = ev.get("session_id") or pathlib.Path(
+        ev.get("transcript_path") or "").stem
+    label = ti.get("description") or agent
+    try:
+        plan = policy.route(state[:STATE_LIMIT], default=default)
+    except (Exception, SystemExit) as e:
+        # Both, and they arrive for different reasons: jev.py reports a missing
+        # key or a dead API as SystemExit, which is not an Exception, while a
+        # malformed answer raises KeyError inside decide(). Either way the
+        # dispatch is left alone, which is indistinguishable from a hold until
+        # the log says otherwise -- so fall through to the one record() below
+        # rather than logging here, and keep the failure on the same path as
+        # the decision. route.py:route_one does the same.
+        plan = {"model": default, "effort": policy.EFFORT[default],
+                "why": f"jev error: {decisions.why_of(e)}"}
+
+    # Before the early return, not after: a decision that changed nothing is
+    # still a decision, and it is the one /jev-explain exists to show.
+    decisions.record(session, label, default, plan,
+                     state, dispatch=ev.get("tool_use_id"))
+
     if plan["model"] == default:
         return
 
@@ -61,5 +83,8 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
+    except (Exception, SystemExit):
+        # SystemExit too: it is how jev.py reports a missing key, an HTTP error
+        # or a network failure, and an uncaught one exits 1 with a message on
+        # stderr rather than the silent 0 this hook promises.
         sys.exit(0)

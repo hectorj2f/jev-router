@@ -28,19 +28,30 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import decisions  # noqa: E402
 import policy  # noqa: E402
 
 
-def route_one(shard: dict, default: str, cache: bool) -> dict:
+def route_one(shard: dict, default: str, cache: bool,
+              session: str | None = None) -> dict:
     out = dict(shard)
     try:
         decision = policy.route(shard["task"], default=default, cache=cache)
-    except SystemExit as e:
+    except (SystemExit, Exception) as e:
         # Fail open: an unrouted shard runs on the default, it does not fail the
         # fan-out. A router that can take the whole run down with it is worse
         # than no router.
-        return {**out, "model": default, "effort": policy.EFFORT[default],
-                "why": f"jev error: {e}"}
+        #
+        # Exception as well as SystemExit. jev.system_one reports its own
+        # failures as SystemExit, but a malformed answer used to raise KeyError
+        # inside decide(), and that escaped pool.map and lost every shard of
+        # the fan-out -- with nothing logged, since the record is written below.
+        decision = {"model": default, "effort": policy.EFFORT[default],
+                    "why": f"jev error: {decisions.why_of(e)}"}
+    # Logged including the failures, which is the half of "did it even fire"
+    # that nothing else answers.
+    decisions.record(session or "", str(shard.get("id") or "task"), default,
+                     decision, shard["task"], dispatch=shard.get("dispatch"))
     return {**out, **decision}
 
 
@@ -101,15 +112,67 @@ def detail(r: dict, default: str) -> None:
     print()
 
 
+def table(routed: list[dict], column: str = "shard",
+          extra: tuple[str, dict] | None = None) -> None:
+    """A fan-out at a glance. Shared with explain.py, which replays one.
+
+    `column` only names the first heading: a replay is a list of dispatches
+    that happened, not of shards about to run.
+
+    `extra` is (heading, {id: cell}), one more column. It exists so that
+    `explain.py --replay` can put a counterfactual gate beside the decision
+    without a second renderer, which would be free to disagree with this one
+    about what the decision was. What the cells say is the caller's business;
+    an id the map does not have prints blank, so a column may cover some rows
+    and not others.
+    """
+    head, cells = extra if extra else ("", {})
+    tail = f" {head:<9}" if extra else ""
+    hdr = f"{column:<28} {'model':<7} {'need':>5} {'conf':>5}{tail}  advice"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in routed:
+        got = f" {cells.get(r['id'], ''):<9}" if extra else ""
+        if "why" in r:
+            print(f"{r['id'][:28]:<28} {r['model']:<7} {'--':>5} {'--':>5}{got}  "
+                  f"{r['why']}")
+            continue
+        notes = [k for k, v in r["advice"].items() if v]
+        if r["held"]:
+            notes.append(f"held from {r['suggested']}")
+        print(f"{r['id'][:28]:<28} {r['model']:<7} {r['need']:>5.2f} "
+              f"{r['conf']:>5.2f}{got}  {', '.join(notes) or '-'}")
+
+    # Counted over the models actually in front of us, in ladder order, with
+    # anything else appended. Tallying over policy.TIERS alone counts the
+    # running process's ladder: explain.py renders rows read off disk, and a
+    # log may hold both providers -- which printed "0xhaiku, 1xsonnet, 0xopus"
+    # under three rows, and all zeroes for a claude log read under codex.
+    seen = {r["model"] for r in routed}
+    order = [t for t in policy.TIERS if t in seen]
+    order += sorted(seen - set(order))
+    tally = {t: sum(1 for r in routed if r["model"] == t) for t in order}
+    print("\n" + (", ".join(f"{n}x{t}" for t, n in tally.items()) or "nothing"))
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("task", nargs="*",
                    help="task text; omit to read a JSON array on stdin")
-    p.add_argument("--default", default="sonnet", choices=policy.TIERS,
-                   help="the model the fan-out would otherwise use")
+    # The middle rung of whichever ladder is active, not a literal. `choices`
+    # became provider-dependent and argparse never validates a *default*
+    # against it -- only a value actually typed -- so a hardcoded "sonnet"
+    # sailed past the parser under codex and raised in decide() instead,
+    # taking down the whole fan-out from the one path whose own comment says
+    # a router must never be able to do that.
+    p.add_argument("--default", default=policy.TIERS[1], choices=policy.TIERS,
+                   help="the model the fan-out would otherwise use "
+                        f"(default {policy.TIERS[1]})")
     p.add_argument("--table", action="store_true", help="human-readable output")
     p.add_argument("--json", action="store_true", help="JSON, even for positional tasks")
     p.add_argument("--no-cache", action="store_true", help="bypass the disk cache")
+    p.add_argument("--session", default="",
+                   help="record each decision under this session id, for explain.py")
     p.add_argument("--workers", type=int, default=12)
     args = p.parse_args()
 
@@ -126,7 +189,8 @@ def main() -> None:
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         routed = list(pool.map(
-            lambda s: route_one(s, args.default, not args.no_cache), shards))
+            lambda s: route_one(s, args.default, not args.no_cache, args.session),
+            shards))
 
     # A single task typed by hand wants the reasoning; a pipe wants JSON.
     if args.json or not (args.table or args.task):
@@ -138,21 +202,7 @@ def main() -> None:
         detail(routed[0], args.default)
         return
 
-    hdr = f"{'shard':<28} {'model':<7} {'need':>5} {'conf':>5}  advice"
-    print(hdr)
-    print("-" * len(hdr))
-    for r in routed:
-        if "why" in r:
-            print(f"{r['id'][:28]:<28} {r['model']:<7} {'--':>5} {'--':>5}  {r['why']}")
-            continue
-        notes = [k for k, v in r["advice"].items() if v]
-        if r["held"]:
-            notes.append(f"held from {r['suggested']}")
-        print(f"{r['id'][:28]:<28} {r['model']:<7} {r['need']:>5.2f} {r['conf']:>5.2f}  "
-              f"{', '.join(notes) or '-'}")
-
-    tally = {t: sum(1 for r in routed if r["model"] == t) for t in policy.TIERS}
-    print("\n" + ", ".join(f"{tally[t]}x{t}" for t in policy.TIERS))
+    table(routed)
 
 
 if __name__ == "__main__":

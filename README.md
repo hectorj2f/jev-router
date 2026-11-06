@@ -1,8 +1,8 @@
 # jev-router
 
-Pick the Anthropic model for a Claude Code subagent based on what the task
-actually needs, using [TypeSafe's Jev](https://docs.typesafe.ai) to score the
-task first.
+Pick the model for a subagent based on what the task actually needs, using
+[TypeSafe's Jev](https://docs.typesafe.ai) to score the task first. Works on
+Claude Code and on OpenAI Codex, off one copy of the policy.
 
 The interesting part of this repo is not the router. It is the measurements,
 including the ones that say the idea doesn't work. Those are in
@@ -29,7 +29,10 @@ advice = {"confirm": irreversible > 0.60,    # a confirmation step, not a bigger
           "clarify": ambiguous   > 0.70}     # a question back, not a bigger model
 ```
 
-`need >= 0.60` → opus, `>= 0.25` → sonnet, else haiku.
+`need >= 0.60` → the dear rung, `>= 0.25` → the middle one, else the cheap one.
+On Claude that is opus / sonnet / haiku; on Codex, `gpt-6-astra` / `gpt-6.1-sol`
+/ `gpt-6-luna`. The two lines are the same numbers either way — they mark a
+position on a three-rung ladder, and they were measured on Claude's.
 
 **Upgrades are ungated; downgrades must be earned.** Opus on a task that only
 needed Haiku costs a fraction of a cent. Haiku on a task that needed Opus costs
@@ -55,9 +58,9 @@ git clone https://github.com/hectorj2f/jev-router ~/jev-router
 chmod +x ~/jev-router/*.py
 ```
 
-Then pick a front end. There are two, they do the same thing, and they read the
-same `policy.py` — **run one or the other, not both**, or every dispatch gets
-priced twice.
+Then pick a front end. There are three — two for Claude Code, one for Codex —
+they do the same thing, and they read the same `policy.py`. **Run one per
+host, not two**, or every dispatch gets priced twice.
 
 ### As a mod — Claude Code 2.1.287 or later
 
@@ -87,25 +90,67 @@ rather do it by hand, the entry is:
 
 Hooks hot-reload — no restart, and it applies to sessions already open.
 
+### On OpenAI Codex
+
+```bash
+~/jev-router/install.py --codex     # --check to see the state, --uninstall to undo
+```
+
+The front end is `hook_codex.py`, a `PreToolUse` hook matched on
+`.*spawn_agent$`. Install writes `~/.codex/hooks.json` — a *sibling* of
+`config.toml`, not `hooks/hooks.json`, which is the plugin-relative path. It
+never writes `config.toml`, because TOML does not round-trip through a rewrite
+the way JSON does.
+
+The matcher has to be a regex. Codex compiles a matcher of only word characters
+to an exact name match, and the V2 multi-agent backend registers the tool inside
+a namespace and hands the hook the namespace and the name run together —
+`collaborationspawn_agent`, on all 443 real spawns in the rollouts on the
+machine this was written on. A bare `spawn_agent` is therefore the one spelling
+that can never fire. Matching the tail keeps the V1 name working and survives a
+renamed namespace.
+
+Codex asks you to trust the hook the first time it loads it, and again after
+any change to the command. If you already declare `[hooks]` in `config.toml`,
+pick one file — Codex loads both and a doubled entry routes every dispatch
+twice.
+
+Codex is the better-placed of the three hosts, for one reason: `PreToolUse`
+hands over the parent's own resolved model as a field, so there is no
+transcript to scrape and `policy.session_tier` has no Codex counterpart at all.
+
+Two precedence rules, both read off the source rather than guessed. A model
+this hook supplies **beats** `[agents] default_subagent_model`, which is only
+the fallback. It **loses** to an `agent_type` role that pins a model of its
+own, because the role is applied after the override.
+
 ### Either way
 
-Every subagent dispatch now gets a model chosen for it. Both front ends respect
-an explicit `model` in the dispatch, skip forks (a fork always inherits the
-parent model), and fail open, so neither can block a dispatch.
+Every subagent dispatch now gets a model chosen for it. All three front ends
+respect an explicit `model` in the dispatch, decline to touch a fork, and fail
+open, so none of them can block a dispatch.
 
-The mod is the better of the two where you can run it, because the facts the
-hook has to go and find arrive as fields of the event it listens to, and
-because it listens to more than the `Agent` tool:
+Failing open matters more on Codex than on Claude: `updatedInput` replaces the
+whole argument object rather than merging into it, and `SpawnAgentArgs` is
+`deny_unknown_fields`, so an argument object this got wrong would kill the
+spawn instead of being ignored. Every error path there exits 0 with no output,
+which leaves the arguments exactly as the model wrote them.
 
-| | `hook_agent.py` | the mod |
-|---|---|---|
-| the session's tier | parsed back out of the transcript file | `e.parentModel`, already resolved |
-| is this a fork | inferred from `subagent_type` | `e.fork` |
-| did the caller pick a model | read out of the raw tool input | `e.model` |
-| agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch |
+On Claude Code the mod is the better of the two where you can run it, because
+the facts the hook has to go and find arrive as fields of the event it listens
+to, and because it listens to more than the `Agent` tool. Codex's hook is in
+the right-hand column's position without needing a mod at all:
 
-It also carries two commands, `/jev-probe` and `/jev-route`, which are the
-next two sections.
+| | `hook_agent.py` | the mod | `hook_codex.py` |
+|---|---|---|---|
+| the session's tier | parsed back out of the transcript file | `e.parentModel`, already resolved | `model`, already resolved |
+| is this a fork | inferred from `subagent_type` | `e.fork` | `fork_turns` / `fork_context` |
+| did the caller pick a model | read out of the raw tool input | `e.model` | `tool_input.model` |
+| agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch | n/a |
+| the `confirm` advice | reachable only on a dispatch it already re-tiers | printed at spawn, always | same as `hook_agent.py`; [see below](#the-advice-half-mostly-unbuilt) |
+
+It also carries three commands — `/jev-probe`, `/jev-route` and
+`/jev-explain` — which are the next three sections.
 
 ### Find out which tiers you can actually serve
 
@@ -161,6 +206,16 @@ A one-tier ladder is a working state, not an error — there's nothing to route
 between, so the hook leaves every dispatch alone. So is no ladder at all: with
 nothing confirmed serviceable, the only model known to work is the one the
 session is already on, and every decision clamps to it.
+
+**On Codex there is nothing to probe.** codex-cli caches the catalogue it was
+served, keyed by a hash of the account, at `~/.codex/models_cache.json`, and
+that file carries a `visibility` and a `supported_in_api` per model. So the
+question `probe.py` has to spend a live request on for Claude is already
+answered on disk, for free, and it is re-read on every decision rather than
+whenever someone last remembered to probe. `JEV_TIERS` still wins. If the
+catalogue can't be read at all the full ladder is assumed, exactly as an
+unprobed Claude does; if it reads and lists none of the three rungs, that is a
+measurement that came back empty and routing stops.
 
 ### Try it without installing anything
 
@@ -220,9 +275,10 @@ design-epoch                 opus     0.86  0.71  clarify
 2xhaiku, 3xsonnet, 5xopus
 ```
 
-Five of ten held at opus, every one of them for weak evidence — `tf-apply` at
-confidence 0.00, `binding-guard` at 0.06. That is the asymmetry working, not the
-router failing.
+Five of ten on opus, but only four of those are holds — and every hold is
+there for weak evidence, `tf-apply` at confidence 0.00, `binding-guard` at
+0.06. The fifth, `design-epoch`, cleared the opus line outright at `need` 0.86.
+That is the asymmetry working, not the router failing.
 
 Jev is non-deterministic: identical input drifts by a few hundredths of a point
 between runs, so your numbers will differ slightly from these. Tier assignments
@@ -230,6 +286,157 @@ near a threshold can flip.
 
 Piped without `--table` it emits JSON suitable as `args` to
 `routed-fanout.workflow.js`.
+
+### See what it decided
+
+```bash
+/jev-explain        # from the mod, scoped to the session you are in
+./explain.py        # from a shell, the most recently written log
+```
+
+A routing decision is invisible by construction. It is made before the agent
+starts, the only trace it leaves is a model id on a transcript nobody opens,
+and by the time the work comes back wrong the reasoning is gone. Worse, all
+three front ends return early when the decision matches the tier already in
+use — so a hold doing its job has always looked exactly like the router not
+running.
+
+Every decision is now appended to `cache/decisions/<session>.jsonl`, including
+the ones that changed nothing, and `explain.py` reads them back:
+
+```
+session 018f2c91-...: 4 decisions, 6m ago to 40s ago
+
+decision                     model    need  conf  advice
+--------------------------------------------------------
+1  review the retry guard    opus     0.71  0.48  clarify
+2  gofmt the fixtures        haiku   -0.09  0.91  -
+3  bump the pinned dep       opus     0.22  0.14  held from sonnet
+4  design epoch rollover     opus     0.86  0.71  clarify
+
+1xhaiku, 0xsonnet, 3xopus
+
+./explain.py <n> for everything behind one of them
+```
+
+The table is the default view because a dispatch router decides many times in
+one session, and a wrong decision is visible as the row that looks unlike its
+neighbours — one bookkeeping task on opus, or six in a row held. A single
+decision shown alone has nothing to look unlike. `./explain.py 3` then prints
+everything behind one of them, in the same layout `./route.py` uses for a task
+scored by hand: the task text, the gate that fired, the five signals.
+
+```bash
+./explain.py 3              # everything behind decision 3
+./explain.py --last         # the most recent one
+./explain.py --sessions     # every session with a log
+./explain.py --session <id> # one that isn't the newest
+./explain.py --json         # the records themselves
+```
+
+This is the other half of the `verify.py` join. `verify.py` reports what each
+subagent actually ran on; the log reports what it was supposed to run on and
+why, so a disagreement between the two localises to the engine rather than the
+policy.
+
+The log holds dispatches only — `/jev-route` prints its reasoning on the spot
+and isn't recorded. It is pruned at seven days, task text is cut at 4,000
+characters with the original length kept alongside, and `cache/` is
+gitignored. `JEV_DECISIONS_DIR` moves it.
+
+Each record (schema 2) also carries what a threshold will one day be fitted
+on, rather than only what was concluded:
+
+- `jev` — the raw answer: every level probability of `depth` and `breadth`,
+  the three nouls, the version Jev says answered, the version requested, and a
+  hash of the question set. A different gate can then be replayed over past
+  dispatches instead of judged on new traffic alone.
+- `dispatch` — the host's `tool_use_id` for the spawn, so an outcome found
+  later joins back by id rather than by a label that repeats.
+- `outcome` — `null` at decision time, because nothing then can know whether
+  the work was good enough. It is the field calibration needs, and nothing
+  fills it yet.
+- `provider`, and `why` on any decision Jev could not make — a failure is
+  logged by all three front ends, so "could not reach Jev" and "ran and held"
+  no longer look the same.
+
+The idea is [gargpratyush/jev-router](https://github.com/gargpratyush/jev-router)'s
+— see [Related work](#related-work). Theirs explains one decision, because a
+proxy that routes conversational turns has exactly one live at a time.
+
+### Replay a different gate over the decisions already made
+
+```bash
+./replay.py                  # the newest session
+./replay.py --all            # every session on disk
+./replay.py --sweep          # how the answer moves with the bar
+./explain.py --replay        # as an extra column beside what actually ran
+```
+
+Keeping the raw answer is only worth the bytes if something reads it back.
+`replay.py` is that reader: it recomputes each logged dispatch under a
+different downgrade gate and prints it beside the one that ran. It calls
+nothing, so a gate can be judged on traffic that already happened rather than
+on the next fortnight's.
+
+The gate it replays is the one the current policy cannot express. Today
+(**a**) collapses `depth` and `breadth` into a single weighted `need` and then
+gates the downgrade on Jev's own `confidence` field — which the
+JEV-as-a-Judge study pointedly does not use, its formula being unpublished.
+Nowhere in that is a probability of the thing being decided.
+
+(**b**) keeps the levels apart. Jev returns a probability per level, so
+`(depth, breadth)` is a distribution over 25 outcomes; push each through the
+same weights and the same two lines and it becomes a distribution over the
+three rungs. A downgrade then needs **P(this rung is enough) ≥ τ** — a
+probability of the decision itself, which is the quantity the paper's cascade
+is actually validated on.
+
+On the recorded answer the suite replays — depth `.04/.13/.68/.15/0`, breadth
+`.03/.01/.02/.79/.15`, mechanical `.88`:
+
+```
+decision                       (a) took  (b)       P cheap   P mid  P dear  why (b)
+-----------------------------------------------------------------------------------
+1  rename DueAt                sonnet    sonnet      0.182   0.795   0.022  P(<= sonnet) 0.977 >= 0.7
+```
+
+Both reach sonnet, but only one of them says 0.977.
+
+**The default τ is worth nothing.** It is a placeholder so the tool runs, not
+a finding. Choosing it needs outcome labels, and `outcome` is still null on
+every record. Use `--sweep`, which prints the disagreement count against the
+bar: a τ whose neighbours give the same answer is one the data is insensitive
+to, and a cliff is where a guessed threshold would have been doing the
+deciding.
+
+```bash
+./replay.py --tau 0.85              # one bar for every transition
+./replay.py --tau 'opus>haiku=0.95' # ... or one per transition
+```
+
+Per transition because the two are not the same bet: opus → sonnet keeps a
+capable model, opus → haiku is the one that produces a confident wrong answer.
+
+A record is skipped rather than guessed at when it cannot be replayed —
+schema 1 predates the raw answer, a front end that could not reach Jev logged
+no answer, and level probabilities that do not sum to 1 (±0.025), are missing
+a level, or carry a label the questions never had are refused rather than
+renormalised. Rungs are computed on the full ladder and only then clamped to
+what that endpoint served, so a missing tier never moves a probability.
+
+Two things it assumes, both untested. That `depth` and `breadth` are
+independent — a deep task is plausibly also broad, and a positive correlation
+would put more mass in the tails than this computes. And that `mechanical` can
+stay a point value: a noul has a distribution too, and collapsing it to its
+mean makes every rung probability here a conditional one, computed as though
+`mechanical` were known exactly. Because it enters `need` as a constant it
+shifts all 25 cells by the same amount, so it cannot reorder them — but a
+sharp P(≤ sonnet) sitting just over τ may be sharp only because the spread in
+one of its three inputs was dropped. Which direction that moves a real
+decision is unmeasured.
+
+**This changes no routing.** It is the measuring instrument, not the policy.
 
 ## Verifying it works
 
@@ -255,8 +462,18 @@ PASS  single-tier ladder routes nothing
 PASS  never routes to an unavailable tier
 PASS  routes to haiku when it is available
 PASS  updatedInput preserves every original key
+PASS  a decision survives a round trip
+PASS  a long task is cut, and says how long it was
+PASS  records accumulate in order
+PASS  a session with a log can be found without being named
+PASS  a torn line costs one record, not the log
+PASS  a session id cannot escape the log dir
+PASS  no session id, no log
+PASS  a decision that changed nothing is still logged
+PASS  a jev outage is logged, not swallowed
+PASS  a stale log survives a concurrent prune
 
-13/13 passed
+23/23 passed
 ```
 
 The routing cases pin `JEV_TIERS` so they test the policy rather than your
@@ -266,6 +483,47 @@ a red light that means "your project lacks sonnet" is testing the wrong thing.
 The two routing cases assert *not opus* and *stays opus* rather than exact
 tiers, since Jev drifts between calls and a task near a threshold can flip.
 
+The log cases point `JEV_DECISIONS_DIR` at a temp directory, so a self-test
+run never lands in the log you then read with `./explain.py`.
+
+The Codex hook has its own suite, which needs no key at all — every case pins
+the decision and runs the hook by path, so nothing is sent anywhere:
+
+```bash
+./selftest_codex.py                                      # 27/27
+./selftest_route.py                                      # 61/61
+```
+
+`selftest_route.py` covers the plumbing under every front end, also offline:
+that the Jev client turns a refused connection, a timeout or a non-JSON body
+into one catchable error; that it asks for the pinned version; that the cache
+is keyed on that version and never stores an answer missing a field; and that
+one bad shard in a `route.py` fan-out costs that shard, not the whole run.
+Its fixture is a real `jev-1.14.0` answer rather than an invented one.
+
+The `replay.py` cases hold that fixture to arithmetic done by hand — the 25
+cells of the outer product summing to `.1822/.7953/.0225` — so that moving a
+weight or a line fails the suite rather than silently moving the counterfactual
+too. Checked by mutation, not by assertion: each of the three weights and both
+tier lines was moved in turn, and every one of the five reddens the suite.
+
+The rest are the refusals, and they are most of the file: levels that do not
+sum, a missing level, a label the questions never had, a level that is NaN,
+negative, or a number sent as a string, an answer that is a list or a string
+rather than an object, an answer scored under a question set that has since
+been reworded, a rung the endpoint does not serve, and every malformed
+`--tau` — a bar outside (0, 1], a tier name that is not on either ladder, and
+a pair naming an upgrade or the same tier twice. A gate that silently ignored
+a bar you typed would be worse than one that refused it.
+
+Most of it is the shapes that must *not* route: both fork spellings and all
+four ways `fork_turns` can mean "all", a V1 `fork_context` call, a parent on a
+model off the ladder, malformed stdin, and a spawn of some other tool. Then
+the ones that must: a well-formed `updatedInput` that preserves every other
+key verbatim, an inherited effort replaced rather than left behind, the effort
+key *absent* rather than null when a rung asks for none, and a hold still
+reaching the decision log.
+
 **2. The mod's logic, without Jev.** The same assertions against the event the
 mod sees, with `route.py` stood in for, so no task leaves the machine and no
 key is needed.
@@ -274,9 +532,14 @@ key is needed.
 claude plugin test ~/jev-router
 ```
 
-These are the one part of this repo that has never been run: they were written
-on 2.1.267, where `claude plugin test` does not exist yet. Read a failure
-before believing it.
+The harness is the one part of this repo that has never been run: these were
+written on 2.1.267, where `claude plugin test` does not exist yet. Read a
+failure before believing it.
+
+The two pure functions behind the spawn line and the irreversible warning are
+exported for this reason, and have been driven directly under `node` — so
+what is unexercised is the mod's event plumbing, not the text those
+assertions check.
 
 **3. What your subagents actually ran on.** The hook rewriting `model` proves
 only that the hook ran — this proves Claude Code honoured it. Subagent
@@ -299,16 +562,47 @@ session ddce018e-6787-449c-a080-12fbe80314fc
 That is a ten-way review fan-out *before* the hook: every agent on opus,
 including the ones doing bookkeeping.
 
+On Codex the same job is `./verify_codex.py`. Codex writes one rollout per
+spawned subagent — `~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl`, plain
+JSONL — rather than nesting them under the parent, so the join is per file:
+`session_meta.source.subagent.thread_spawn.agent_path`'s last segment is the
+spawn's `task_name`, which is the label the hook recorded. Each row gets a
+verdict — `ok`, `OVERRIDDEN`, `OFF LADDER`, `NO TURN`, `UNREADABLE`,
+`UNROUTED` — and it exits non-zero when it cannot verify anything at all.
+
+That last part is the point. The rollout format drifts: ten `cli_version`s
+appear across the 442 rollouts this was built against, with fields appearing
+and disappearing between them. A verifier that answered "all clear" because it
+had failed to parse anything would be worse than none, so an unrecognised
+rollout is reported as one, with the version named.
+
+**Measured here, and worth repeating on your own account before trusting it:**
+across those 442 rollouts, 116 of 116 spawns that named a `model` ran on
+exactly that model — the mechanism works. But every one of those 116 asked for
+`gpt-6-astra`, and only sol and astra have ever run on this machine. So what is
+proven is that an *upgrade* is honoured. A downgrade to `gpt-6-luna` is
+unexercised, and a silently ignored downgrade looks exactly like a dispatch
+that worked. Run `./verify_codex.py` deliberately after your first few
+dispatches: an `OVERRIDDEN` row is what that failure would look like.
+
 **4. The A/B.** Run `verify.py` to capture the baseline, install the hook,
 dispatch a mixed batch — something mechanical (*"run gofmt on X and commit"*)
 alongside something deep (*"decide whether the guard should reject or coerce,
 and implement it"*) — then re-run `verify.py`. The mechanical ones should come
 back on a cheaper tier and the deep ones should still say opus.
 
-If nothing changes, check in this order: the front end is actually loaded
-(`claude plugin list` for the mod, an entry in `~/.claude/settings.json` for
-the hook); `claude --debug` shows it firing; `./selftest.py` still passes; and
-the dispatch didn't already name a `model`, which both deliberately respect.
+If nothing changes, start with `./explain.py`, which separates the two cases
+that used to look identical: an empty log means the front end never fired, and
+a log full of holds means it fired and the gate refused. Then, in order: the
+front end is actually loaded (`claude plugin list` for the mod, an entry in
+`~/.claude/settings.json` for the hook, `./install.py --codex --check` for
+Codex); `claude --debug` shows it firing; `./selftest.py` still passes; and
+the dispatch didn't already name a `model`, which all three deliberately
+respect.
+
+On Codex add two of its own: the hook is only live once you have answered its
+trust prompt, and a dispatch is only routed if it is a fresh spawn — a
+full-history fork is left alone by design.
 
 ## Findings
 
@@ -463,26 +757,67 @@ false-cheap, the first thing to check is the prompt, and the next lever is
 raising the confidence floor from 0.70. Do not reach for another signal; that
 was tried and measured as contributing nothing.
 
-## The advice half, still unbuilt
+## The advice half, mostly unbuilt
 
-`decide()` returns `advice.confirm` and `advice.clarify`, and nothing has ever
-acted on them. They print. That was defensible when the only front end was a
-`PreToolUse` hook, whose entire vocabulary is a model name — but the finding
-they come from says the response to irreversibility is a confirmation step and
-the response to ambiguity is a question back, and the router currently delivers
-neither. Two sketches, both deliberately not in this PR:
+`decide()` returns `advice.confirm` and `advice.clarify`. The finding they come
+from says the response to irreversibility is a confirmation step and the
+response to ambiguity is a question back, and for a long time the router
+delivered neither — they printed in `./route.py` output nobody was reading at
+dispatch time.
 
-**`confirm` should raise the confirmation posture, not print.** A mod sees
-`tool.check` and can turn one into a prompt, so the shape is obvious: a
-dispatch that scored `irreversible > 0.60` gets its writes confirmed, the rest
-of the session doesn't. The blocker is identity and read/write. `ToolCheckInput`
-in the published declarations is `{tool, input, tool_use_id?}` — no `agentId`,
-so you cannot tell which dispatch a tool call came from, and no `isReadOnly`,
-so you cannot tell a read from a write. The documentation says both exist
-(`agentId` from v2.1.290, `isReadOnly` from v2.1.304); the declarations shipped
-alongside it have neither. Built against what is actually declared, this
-prompts on every tool call in the session, which nobody would keep installed
-for a week. Check the declarations before writing it, not the docs.
+**`confirm` now says so at spawn, in the mod.** A dispatch scoring
+`irreversible > 0.60` gets a line of its own (one line, wrapped here):
+
+```
+deploy the staging bump -- irreversible 0.94: writes outside the working
+tree. Tier unchanged; this is a warning, not a gate.
+```
+
+Printed even when the tier decision itself was worth no line, because a
+dispatch the router agreed with is exactly the case where nothing was said
+before, and "deploy this" agreeing with opus is still a deploy. That is also
+the only case that earns the second sentence: where the router *did* re-tier
+the dispatch, a line above this one has just said so, and "tier unchanged"
+would contradict it. So the warning claims it only when it is the sole thing
+printed.
+
+It does **not** move the tier: a cheap model posting the right comment is
+fine, and on a measured run an old `irreversible` floor sent "reformat this
+comment I already wrote" straight to opus on that basis alone.
+
+**Raising the confirmation posture is still blocked.** A mod sees `tool.check`
+and could turn one into a prompt, so the shape is obvious: a dispatch that
+scored `irreversible > 0.60` gets its writes confirmed, the rest of the session
+doesn't. The blocker is identity and read/write: without a dispatch id on the
+tool call you cannot tell which subagent it came from, and without a read/write
+flag you cannot tell a lookup from a deploy. Lacking either, this prompts on
+every tool call in the session, which nobody would keep installed for a week.
+
+The documentation says both fields exist — `agentId` from v2.1.290,
+`isReadOnly` from v2.1.304. Neither has been seen here: this machine is on
+2.1.267, whose `sdk.d.ts` does not declare a `ToolCheckInput` at all, so what
+those versions actually ship is unverified either way. **Read the declarations
+for the version in front of you before writing this**, and treat a field the
+docs promise as unavailable until you have seen it declared.
+
+Neither hook gets this, and the reason is the same on both — it is not a Codex
+quirk. Both carry a message to the user in `permissionDecisionReason`, and
+both already send one on a dispatch they re-tier, so adding the warning there
+would cost a few characters on a string already in flight. On Codex that
+object additionally needs `permissionDecision: "allow"`, or it is discarded
+along with the `updatedInput` it came with.
+
+The half that cannot be had is the half that matters. When the decision
+changes nothing, both hooks return silently with no output at all, and warning
+there would mean emitting a `hookSpecificOutput` — on Codex, an outright
+`allow` — for a spawn they would otherwise not have spoken about, turning a
+router into a thing that approves tool calls. That trade is the wrong way
+round, and it rules out precisely the case the mod's version exists for: a
+deploy the router agreed with, where nothing else would be said.
+
+This is the one capability gap in the table above that is about the seam
+rather than the host. `$.ui.log` lets the mod speak without also deciding
+something; a `PreToolUse` hook's only voice is attached to a verdict.
 
 **`clarify` should reach the parent before the dispatch does.** A task reading
 `ambiguous > 0.70` is one the subagent will guess at, and the parent is the
@@ -497,29 +832,65 @@ that fires on nearly everything is noise. It needs a threshold measured on
 
 ~$0.00003 per task routed ($0.042/Mtok input, output free). A 50-shard fan-out
 is about a tenth of a cent. Answers are memoized for 7 days in `cache/`, keyed
-on the task text *and* the question set — the latter matters, since keying on
-the text alone silently serves answers to questions you've since edited.
+on the task text, the question set *and* the Jev version requested — keying on
+the text alone silently serves answers to questions you've since edited, or
+from a scorer you've since moved off.
+
+**The Jev version is pinned**, to `jev-1.14.0`, rather than `jev-latest`. The
+thresholds were tuned against one version of the scorer, and "latest" moves
+under them without saying so: the JEV-as-a-Judge study
+([arXiv 2609.26550](https://arxiv.org/abs/2609.26550)) ran on 1.13.0, and by
+November the API was answering as 1.14.0. The study measures nothing across
+versions; what it does report is that a threshold does not transfer between
+workloads, which is the same argument one step out. Moving is a decision:
+`export JEV_MODEL=jev-1.15.0` (or `jev-latest`, knowingly). If the pinned
+version is ever retired the router stops routing, fails open, and says why in
+the decision log.
 
 **Every routed task is POSTed to `api.typesafe.ai`**, carrying task text, file
 paths, and whatever else is in the prompt. That is a real disclosure decision,
 not a footnote. Think hard before pointing this at anything whose inputs can be
 customer-derived.
 
+On Codex that decision is sharper than it looks. Codex encrypts the `message`
+of a spawn in its own rollouts — it is stored Fernet-wrapped on disk, which is
+why `verify_codex.py` joins on `task_name` and never on the task text. This
+router reads that same message before it is written and sends it out in the
+clear. Nothing is bypassed and no file is decrypted; the hook simply sits
+upstream of the encryption. But it does mean the content Codex chose to
+protect at rest is content jev-router transmits, and that is worth deciding on
+deliberately rather than discovering later.
+
+The decision log keeps the first 4,000 characters of each of those tasks on
+disk for seven days, in `cache/`, which is gitignored and goes nowhere. It is
+a second copy of text already sent to Jev rather than a new exposure, but it
+is a copy that outlives the session, so it is worth knowing about. `rm -rf
+cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
+
 ## Files
 
 | | |
 |---|---|
-| `policy.py` | the questions, scoring, gates, cache, transcript readers. The only copy of the policy — everything imports it |
+| `policy.py` | the questions, scoring, gates, cache. The only copy of the policy — everything imports it |
+| `providers/` | what differs per host: the ladder, the slugs, the effort each rung takes, and how to find out which rungs are served. `claude.py` also holds the two transcript readers, which have no Codex counterpart |
 | `jev.py` | zero-dependency client for `POST /v1/systemone`; backs off on 429/529, normalises confidence across all three primitives (`noul` returns none, so it computes `\|2p − 1\|`) |
-| `hooks/register.js` | the mod: routes `agent.spawn`, and serves `/jev-probe` and `/jev-route`. The recommended entry point, on 2.1.287+ |
-| `hook_agent.py` | the `PreToolUse` hook. The entry point below 2.1.287 |
-| `install.py` | registers/removes the hook in `~/.claude/settings.json`, with a backup |
+| `hooks/register.js` | the mod: routes `agent.spawn`, and serves `/jev-probe`, `/jev-route` and `/jev-explain`. The recommended entry point, on 2.1.287+ |
+| `hook_agent.py` | the Claude Code `PreToolUse` hook. The entry point below 2.1.287 |
+| `hook_codex.py` | the Codex `PreToolUse` hook on `spawn_agent`. The entry point there |
+| `codex/hooks.json` | the hook declaration, ready to copy into `~/.codex/` by hand |
+| `install.py` | registers/removes the hook in `~/.claude/settings.json`, or in `~/.codex/hooks.json` with `--codex`. Backs up before every write |
 | `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
+| `decisions.py` | the append-only decision log, one JSONL file per session. Written by all three front ends, including the decisions that changed nothing |
+| `explain.py` | reads the log back: the session as a table, then everything behind any one row |
+| `replay.py` | recomputes logged dispatches under a different downgrade gate, offline. Measures; routes nothing |
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
-| `selftest.py` | drives the hook with synthetic events; asserts routing and every fail-open path |
-| `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. Never yet run |
+| `selftest.py` | drives the Claude hook with synthetic events; asserts routing and every fail-open path |
+| `selftest_codex.py` | the same for `hook_codex.py`, with the decision pinned so it needs no key |
+| `selftest_route.py` | the Jev client, the cache, the fan-out and the decision log, offline, against a real recorded answer |
+| `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. The harness needs 2.1.287+ and has never run; the two line builders it asserts on are exported and have been driven directly |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
+| `verify_codex.py` | the same against Codex rollouts, joined to the decision log by `task_name`, one verdict per dispatch |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
 | `experiments/context_dilution.py` | whether session context in the state helps the router or buries the task |
 
@@ -535,14 +906,15 @@ it after writing this one.
 |---|---|---|
 | mechanism | loopback proxy on `ANTHROPIC_BASE_URL`, with a sentinel model in `/model` | a mod on `agent.spawn`, or a `PreToolUse` hook |
 | scope | every fresh user turn | subagent dispatches only |
-| CLIs | Claude Code and OpenAI Codex | Claude Code |
+| CLIs | Claude Code and OpenAI Codex | Claude Code and OpenAI Codex |
 | the decision | Jev picks the tier; code adjusts it | Jev answers five atomic questions; code combines them |
 | version floor | none — it sits below the CLI | 2.1.287 for the mod, none for the hook |
 | published measurements | none | [Findings](#findings) |
 
-Use theirs if you want this working today across both CLIs and every turn.
-The reason this repo exists is the last row, and the reason it routes nothing
-but dispatches is the row above it: scoring a conversational turn is the thing
+Use theirs if you want this working today on every turn, and on every CLI
+version rather than above a floor. The reason this repo exists is the
+*published measurements* row, and the reason it routes nothing but dispatches
+is the *scope* row: scoring a conversational turn is the thing
 [Findings](#findings) says does not work, measured over 26 real prompts.
 
 Two places the difference is load-bearing rather than cosmetic:
@@ -562,6 +934,14 @@ Two places the difference is load-bearing rather than cosmetic:
 
 Neither is a reason to prefer this repo over that one today. They are the two
 things worth stealing in the other direction.
+
+Stolen in this direction: `/jev-explain`, theirs first. Their version renders
+the current decision, which is the right shape for a proxy — routing
+conversational turns, there is one decision live at a time and no history to
+compare it against. A dispatch router makes several at once, so
+[the version here](#see-what-it-decided) logs them all and leads with the
+table. The thing worth copying was the observation that a router which cannot
+account for itself is a router you cannot debug.
 
 ## License
 

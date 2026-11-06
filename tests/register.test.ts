@@ -19,8 +19,14 @@
 
 import { test, expect } from 'claude-code/testing'
 import type { AgentSpawnInput, On } from 'claude-code'
+import { adviceLine, decisionLine } from '../hooks/register.js'
 
 const PARENT = 'claude-opus-5'
+const SESSION = 'sess_test'
+
+// What the dispatch is called in the log and in the one-line report: the
+// description, which is the only field written for a human to read.
+const LABEL = 'rename Deadline'
 
 const STATE = [
   'Agent type: general-purpose',
@@ -43,19 +49,50 @@ function dispatch(over: Partial<AgentSpawnInput> = {}): AgentSpawnInput {
   }
 }
 
+// The signals Jev returned for this task, and the `need` the policy computes
+// from them: 0.60*(1.94/4) + 0.40*(3.02/4) - 0.25*0.88. Spelled out because a
+// fixture whose numbers do not satisfy need_of is a shape route.py cannot
+// emit, and a test built on one proves nothing about the real thing.
+const SIGNALS = {
+  depth: 1.94, breadth: 3.02, mechanical: 0.88,
+  irreversible: 0.09, ambiguous: 0.66,
+}
+const NEED = 0.373
+
 /** One element of the array route.py --json prints, with the keys it prints. */
 function decision(over: Record<string, unknown> = {}) {
   return JSON.stringify([{
-    id: 'spawn',
+    id: LABEL,
     task: STATE,
     model: 'sonnet',
     effort: 'medium',
-    need: 0.41,
+    need: NEED,
     conf: 0.82,
     suggested: 'sonnet',
     held: false,
     wanted: 'sonnet',
     tiers: ['haiku', 'sonnet', 'opus'],
+    // `advice` and `signals` are on every successful decision route.py
+    // prints, and the mod reads both: `advice.confirm` raises the irreversible
+    // warning and `signals.irreversible` is the number it quotes.
+    advice: { confirm: false, clarify: false },
+    signals: SIGNALS,
+    // So is `jev`, carrying the raw answer the decision log keeps. The mod
+    // never reads it; it is here so the fixture is a shape route.py emits
+    // rather than a subset someone assembled.
+    jev: {
+      model: 'jev-1.14.0',
+      requested: 'jev-1.14.0',
+      questions: '979664a4215b',
+      cached: false,
+      answers: {
+        depth: { type: 'score', score: 1.94, confidence: 0.82 },
+        breadth: { type: 'score', score: 3.02, confidence: 0.9 },
+        mechanical: { type: 'noul', noul: 0.88 },
+        irreversible: { type: 'noul', noul: 0.09 },
+        ambiguous: { type: 'noul', noul: 0.66 },
+      },
+    },
     ...over,
   }])
 }
@@ -84,6 +121,7 @@ function stub(on: On, out: { exitCode?: number; stdout?: string } = {}) {
     spawned.push(e.model ?? e.parentModel)
     return { model: e.model ?? e.parentModel, agentId: 'agent_test' }
   })
+  on('session.id', async () => SESSION)
 
   return { runs, spawned }
 }
@@ -94,7 +132,20 @@ test('a dispatch is priced on its type, its description and its task', async ($,
   await $.agent.spawn(dispatch())
 
   expect(runs).toHaveLength(1)
-  expect(JSON.parse(runs[0].stdin ?? '')).toEqual([{ id: 'spawn', task: STATE }])
+  expect(JSON.parse(runs[0].stdin ?? '')).toEqual(
+    [{ id: LABEL, task: STATE, dispatch: 'toolu_01test' }])
+})
+
+test('the decision is logged against the session that made it', async ($, on) => {
+  // route.py writes the log, not this file, and it only writes when it is told
+  // which session to write under. Drop the flag and /jev-explain goes quiet
+  // while everything else keeps working, which is the failure nobody notices.
+  const { runs } = stub(on)
+
+  await $.agent.spawn(dispatch())
+
+  expect(runs[0].argv).toContain('--session')
+  expect(runs[0].argv[runs[0].argv.indexOf('--session') + 1]).toBe(SESSION)
 })
 
 test("the parent's own tier is what the task is scored against", async ($, on) => {
@@ -135,6 +186,70 @@ test('a hold is reported, not routed', async ($, on) => {
   await $.agent.spawn(dispatch())
 
   expect(spawned).toEqual([PARENT])
+})
+
+test('an irreversible dispatch is warned about, not re-tiered', async ($, on) => {
+  // The warning is a line, and the line is all it is. A cheap model posting
+  // the right comment is fine; what the irreversibility asks for is a
+  // confirmation step, and buying a bigger model answers none of it. On a
+  // measured run an old `irreversible` floor sent "reformat this comment I
+  // already wrote" straight to opus on this basis alone.
+  //
+  // Only `irreversible` moves from the base fixture: the other four signals
+  // are what produce its `need`, and a deploy being irreversible says nothing
+  // about how hard it is.
+  const { spawned } = stub(on, {
+    stdout: decision({
+      advice: { confirm: true, clarify: false },
+      signals: { ...SIGNALS, irreversible: 0.94 },
+    }),
+  })
+
+  await $.agent.spawn(dispatch())
+
+  // sonnet because the score earned it, not because of the advice: the
+  // fixture's own model field is unchanged by the warning.
+  expect(spawned).toEqual(['sonnet'])
+})
+
+test('the irreversible warning says so, and quotes the score', () => {
+  // Asserted on the text, not through the hook. The only thing `agent.spawn`
+  // exposes is the model the dispatch ran on, and not moving it is the whole
+  // point of this line -- so a test driven through the hook passes equally
+  // well if the warning is never printed at all.
+  const plan = { advice: { confirm: true }, signals: { irreversible: 0.94 } }
+
+  expect(adviceLine(plan, LABEL, true)).toBe(
+    `${LABEL} -- irreversible 0.94: writes outside the working tree. ` +
+    'Tier unchanged; this is a warning, not a gate.')
+  expect(adviceLine({ advice: { confirm: false } }, LABEL, true)).toBeNull()
+})
+
+test('the warning does not claim the tier is unchanged under a re-tier', () => {
+  // decisionLine prints first. An irreversible dispatch usually scores high on
+  // `mechanical`, which is exactly what earns a downgrade, so "opus -> sonnet"
+  // followed by "Tier unchanged" is the common pairing rather than a corner
+  // case. The clause belongs only to the line that stands alone.
+  const plan = {
+    model: 'sonnet', need: NEED, conf: 0.82, wanted: 'sonnet',
+    suggested: 'sonnet', held: false,
+    advice: { confirm: true }, signals: { irreversible: 0.94 },
+  }
+  const decided = decisionLine(plan, 'opus', LABEL)
+
+  expect(decided).toBe(`${LABEL} -- opus -> sonnet (need 0.37, conf 0.82)`)
+  expect(adviceLine(plan, LABEL, !decided)).toBe(
+    `${LABEL} -- irreversible 0.94: writes outside the working tree.`)
+})
+
+test('a plan route.py could not decide produces no line and no throw', () => {
+  // The failure shape: route_one's except branch sets `why` and nothing else,
+  // so neither builder may reach a number on it.
+  const failed = { model: 'opus', effort: 'high', why: 'jev error: 503' }
+
+  expect(decisionLine(failed, 'opus', LABEL)).toBe(
+    `${LABEL} -- not routed: jev error: 503`)
+  expect(adviceLine(failed, LABEL, false)).toBeNull()
 })
 
 test('a fork is never priced', async ($, on) => {
@@ -196,7 +311,7 @@ test('a jev error reaches the dispatch as the tier it already had', async ($, on
   // route.py catches a failed call and routes the shard to the default, with
   // `why` set. That is a report, not a decision to act on.
   const { spawned } = stub(on, {
-    stdout: JSON.stringify([{ id: 'spawn', task: STATE, model: 'opus', effort: 'high', why: 'jev error: 503' }]),
+    stdout: JSON.stringify([{ id: LABEL, task: STATE, model: 'opus', effort: 'high', why: 'jev error: 503' }]),
   })
 
   await $.agent.spawn(dispatch())
@@ -230,7 +345,11 @@ test('a missing description and type still make a scorable state', async ($, on)
 
   await $.agent.spawn(dispatch({ description: '', subagentType: '' }))
 
-  expect(JSON.parse(runs[0].stdin ?? '')[0].task).toBe(
+  const sent = JSON.parse(runs[0].stdin ?? '')[0]
+  expect(sent.task).toBe(
     'Agent type: general-purpose\nDescription: \nTask:\nRename the Deadline field and fix every caller',
   )
+  // The far end of the label's fallback chain. A log row with no name in it is
+  // still a row, and an empty one would sort and truncate strangely.
+  expect(sent.id).toBe('dispatch')
 })
