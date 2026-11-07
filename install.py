@@ -27,8 +27,14 @@ import time
 
 HERE = pathlib.Path(__file__).resolve().parent
 HOOK = HERE / "hook_agent.py"
-SETTINGS = pathlib.Path.home() / ".claude" / "settings.json"
+CLAUDE_HOME = pathlib.Path.home() / ".claude"
+SETTINGS = CLAUDE_HOME / "settings.json"
 MATCHER = "^Agent$"
+# Where `claude plugin install` records what it installed. Read-only here, and
+# only to answer "is the mod also on", which register.js warns about in prose
+# and nothing checked.
+INSTALLED_PLUGINS = CLAUDE_HOME / "plugins" / "installed_plugins.json"
+PLUGIN_MANIFEST = HERE / ".claude-plugin" / "plugin.json"
 
 CODEX_HOOK = HERE / "hook_codex.py"
 CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME")
@@ -129,12 +135,44 @@ def codex_config_declares_hooks() -> bool:
         return False
 
 
+def mod_installed() -> bool:
+    """Whether the mod in hooks/register.js is installed as a plugin too.
+
+    The two are independent front ends onto one policy and register.js says in
+    prose to run one or the other -- both on means every dispatch is scored
+    twice, logged twice, and re-tiered by whichever ran last. That is the same
+    double-declaration install.py already warns about on Codex, and the only
+    reason it went unwarned here is that the two live in different files.
+
+    Best-effort by construction. `claude --plugin-dir ~/jev-router` loads the
+    mod for one session and writes nothing down, so a False is "nothing on
+    record", never "definitely not running". Any surprise in the file is read
+    the same way: this is advice printed beside an install, and it has no
+    business failing one.
+    """
+    try:
+        name = json.loads(PLUGIN_MANIFEST.read_text())["name"]
+        entries = json.loads(INSTALLED_PLUGINS.read_text())["plugins"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    # Keyed `<plugin>@<marketplace>`, and the marketplace is whatever the user
+    # added this clone under, so match on the plugin half. installPath catches
+    # it under a renamed plugin, which is the likelier of the two to be hit.
+    return any(key.split("@")[0] == name
+               or any(str(i.get("installPath")) == str(HERE)
+                      for i in val if isinstance(i, dict))
+               for key, val in entries.items() if isinstance(val, list))
+
+
 def claude_main(a: argparse.Namespace) -> int:
     data = load(SETTINGS)
     installed = registered(data, HOOK.name)
 
     if a.check:
         print(f"{'registered' if installed else 'not registered'} in {SETTINGS}")
+        if installed and mod_installed():
+            print(f"  note: the mod is installed too, and both would route "
+                  f"every dispatch")
         return 0 if installed else 1
 
     if a.uninstall:
@@ -149,6 +187,19 @@ def claude_main(a: argparse.Namespace) -> int:
     if not HOOK.is_file():
         sys.exit(f"no hook at {HOOK}")
     HOOK.chmod(HOOK.stat().st_mode | stat.S_IXUSR)
+
+    if mod_installed():
+        # Not fatal, and not a refusal: on a CLI below 2.1.287 the mod is
+        # installed and simply never loads, which is a perfectly ordinary
+        # reason to want the hook as well.
+        print("  careful      the jev-router mod is installed too.")
+        print("               On 2.1.287+ both load, and every dispatch gets "
+              "scored and")
+        print("               logged twice. Run one or the other:")
+        print("                   claude plugin uninstall jev-router   "
+              "# keep the hook")
+        print("                   ./install.py --uninstall             "
+              "# keep the mod\n")
 
     data.setdefault("hooks", {}).setdefault("PreToolUse", [])
     data["hooks"]["PreToolUse"] = [e for e in data["hooks"]["PreToolUse"]

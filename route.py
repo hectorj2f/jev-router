@@ -93,12 +93,24 @@ def detail(r: dict, default: str) -> None:
     print(f"  confidence   {r['conf']:>5.2f}")
 
     print("\n  signals")
+    # Only when the record was scored against the question set now in this
+    # file. explain.py renders logged decisions through here, and a criterion
+    # that never produced the score beside it is a caption inventing its own
+    # photograph -- the same incomparability replay.py refuses a record over,
+    # one level quieter. A record with no hash predates schema 2 and cannot
+    # claim it either.
+    same_questions = ((r.get("jev") or {}).get("questions")
+                      == policy.QUESTIONS_HASH)
     for name in ("depth", "breadth"):
         v = r["signals"][name]
         criteria = policy.QUESTIONS[name]["criteria"]
         # Jev returns a weighted score across the levels, not a level, so the
         # nearest criterion is an approximation of a value that sits between two.
-        print(f"    {name:<13}{v:>5.2f}/4  ~ {criteria[round(v)][:58]}")
+        gloss = (f"  ~ {criteria[round(v)][:58]}"
+                 if same_questions and 0 <= round(v) < len(criteria) else "")
+        print(f"    {name:<13}{v:>5.2f}/{len(criteria) - 1}{gloss}")
+    if not same_questions:
+        print("    (scored under a different question set; criteria not shown)")
     for name in ("mechanical", "irreversible", "ambiguous"):
         print(f"    {name:<13}{r['signals'][name]:>5.2f}")
 

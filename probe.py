@@ -60,7 +60,15 @@ def pinned(tier: str) -> str | None:
     return os.environ.get(claude.alias_env(tier))
 
 
-def post(url: str, body: dict, headers: dict) -> tuple[bool, str]:
+def post(url: str, body: dict, headers: dict) -> tuple[bool | None, str]:
+    """True served, False not served, None could not be measured.
+
+    The third state is the point. It used to be folded into False, under a
+    comment that identified the distinction exactly -- "unknown, not absent" --
+    and then discarded it, so main() wrote the tier down as GONE. One DNS blip
+    or one timeout permanently narrowed the recorded ladder, and nothing in
+    cache/tiers.json said it had happened.
+    """
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", **headers})
     try:
@@ -71,14 +79,17 @@ def post(url: str, body: dict, headers: dict) -> tuple[bool, str]:
         # A 400 means the request reached a model that exists and disliked the
         # body -- which is all we are asking. Only "not found" rules a tier out.
         return (e.code not in (403, 404), f"HTTP {e.code} {detail}")
-    except Exception as e:  # network, DNS, timeout -- unknown, not absent
-        return False, f"{type(e).__name__}: {e}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
-def probe_vertex(model: str) -> tuple[bool, str]:
+def probe_vertex(model: str) -> tuple[bool | None, str]:
+    # None, not False, on all four of these: a missing project, a missing
+    # credential and a gcloud that would not run are facts about this machine,
+    # not about what Vertex serves.
     project = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
     if not project:
-        return False, "ANTHROPIC_VERTEX_PROJECT_ID unset"
+        return None, "ANTHROPIC_VERTEX_PROJECT_ID unset"
     region = os.environ.get("CLOUD_ML_REGION", "global")
     host = ("aiplatform.googleapis.com" if region == "global"
             else f"{region}-aiplatform.googleapis.com")
@@ -86,19 +97,19 @@ def probe_vertex(model: str) -> tuple[bool, str]:
         token = subprocess.run(["gcloud", "auth", "print-access-token"],
                                capture_output=True, text=True, timeout=30).stdout.strip()
     except Exception as e:
-        return False, f"gcloud: {e}"
+        return None, f"gcloud: {e}"
     if not token:
-        return False, "no gcloud access token (gcloud auth login)"
+        return None, "no gcloud access token (gcloud auth login)"
     url = (f"https://{host}/v1/projects/{project}/locations/{region}"
            f"/publishers/anthropic/models/{model}:rawPredict")
     return post(url, {"anthropic_version": "vertex-2023-10-16", **PING},
                 {"Authorization": f"Bearer {token}"})
 
 
-def probe_anthropic(model: str) -> tuple[bool, str]:
+def probe_anthropic(model: str) -> tuple[bool | None, str]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
-        return False, "ANTHROPIC_API_KEY unset"
+        return None, "ANTHROPIC_API_KEY unset"  # unmeasurable, not unserved
     return post("https://api.anthropic.com/v1/messages", {"model": model, **PING},
                 {"x-api-key": key, "anthropic-version": "2023-06-01"})
 
@@ -124,7 +135,7 @@ def main() -> int:
         return 1
 
     probe = {"vertex": probe_vertex, "anthropic": probe_anthropic}[prov]
-    good, resolved = [], {}
+    good, unknown, resolved = [], [], {}
 
     for tier in TIERS:
         model = pinned(tier)
@@ -142,7 +153,21 @@ def main() -> int:
         resolved[tier] = model
         if ok:
             good.append(tier)
-        print(f"  {tier:<8} {'OK ' if ok else 'GONE'}    {model}{'' if ok else f'  -- {why}'}")
+        elif ok is None:
+            unknown.append(tier)
+        verdict = "OK  " if ok else "????" if ok is None else "GONE"
+        print(f"  {tier:<8} {verdict}  {model}{'' if ok else f'  -- {why}'}")
+
+    if unknown:
+        # The record this writes is read back as a ladder, and a tier absent
+        # from it is routed around. A tier we could not reach is not a tier
+        # that is not there, so the honest thing is to write nothing and keep
+        # whatever the last successful probe said -- the same stance the
+        # zero-confirmed case below takes, for the same reason.
+        print(f"\n{', '.join(unknown)} could not be reached, which is not the same "
+              f"as not being\nserved -- not recording, leaving any previous "
+              f"measurement in place.\nRe-run when whatever that was has cleared.")
+        return 1
 
     if not good:
         # Finding nothing is a failed measurement, not a measurement of

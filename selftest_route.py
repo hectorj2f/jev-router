@@ -503,6 +503,176 @@ def main() -> int:
     check("route.py: under codex the default tier is the middle rung",
           "(default sol)" in " ".join(helped.stdout.split()), helped.stdout[-120:])
 
+    # --- JEV_TIERS: a typo narrows nothing and widens nothing silently -------
+    def tiers_with(value):
+        err = io.StringIO()
+        with env(JEV_TIERS=value), contextlib.redirect_stderr(err):
+            return policy.available_tiers(), err.getvalue()
+
+    got, warned = tiers_with("haiku,opus")
+    check("JEV_TIERS: a list of real rungs is honoured, in ladder order",
+          got == ["haiku", "opus"] and not warned, f"{got} {warned!r}")
+    got, warned = tiers_with("haiku, opus ")
+    check("JEV_TIERS: spaces around the names are not part of them",
+          got == ["haiku", "opus"] and not warned, f"{got} {warned!r}")
+    # The regression: one transposed letter used to route everything to haiku.
+    got, warned = tiers_with("haiku,sonet")
+    check("JEV_TIERS: a typo'd name does not silently narrow the ladder",
+          got == policy.TIERS and "sonet" in warned, f"{got} {warned!r}")
+    got, warned = tiers_with("sonet")
+    check("JEV_TIERS: a wholly unknown list is refused out loud",
+          got == policy.TIERS and "sonet" in warned, f"{got} {warned!r}")
+    got, warned = tiers_with("luna,sol,astra")
+    check("JEV_TIERS: another provider's rungs name the ladder they missed",
+          got == policy.TIERS and "haiku, sonnet, opus" in warned,
+          f"{got} {warned!r}")
+    got, warned = tiers_with(" , ")
+    check("JEV_TIERS: punctuation alone is not an empty ladder",
+          got == policy.TIERS and warned != "", f"{got} {warned!r}")
+
+    # --- the state cap is applied once, where every path reaches it ----------
+    seen = {}
+
+    def capture(state, questions, model=None):
+        seen["state"] = state
+        return copy.deepcopy(REAL)
+
+    with patched(policy, "system_one", capture):
+        policy.ask_meta("x" * (policy.STATE_LIMIT * 2), cache=False)
+    check("state cap: policy.ask_meta cuts to STATE_LIMIT",
+          len(seen["state"]) == policy.STATE_LIMIT, len(seen.get("state", "")))
+
+    seen.clear()
+    with patched(policy, "system_one", capture):
+        # The gap this closes: route.py applied no cap of its own, and it is
+        # both the fan-out and what the mod shells out to.
+        route.route_one({"id": "big", "task": "y" * (policy.STATE_LIMIT * 2)},
+                        policy.TIERS[1], False)
+    check("state cap: route.py's fan-out is bounded by it too",
+          len(seen["state"]) == policy.STATE_LIMIT, len(seen.get("state", "")))
+
+    sent = {}
+
+    def urlopen_capture(req, timeout=None):
+        sent["body"] = json.loads(req.data)
+        return FakeResponse(json.dumps(REAL).encode())
+
+    with patched(jev.urllib.request, "urlopen", urlopen_capture):
+        jev.system_one("z" * (jev.STATE_CHAR_LIMIT * 2), policy.QUESTIONS)
+    check("state cap: jev.system_one holds the API ceiling for every caller",
+          len(sent["body"]["state"]) == jev.STATE_CHAR_LIMIT,
+          len(sent.get("body", {}).get("state", "")))
+
+    # --- the one line a PreToolUse hook gets to say --------------------------
+    plan = policy.decide(REAL["answers"], default="opus",
+                         tiers=["haiku", "sonnet", "opus"])
+    line = policy.decision_reason("opus", plan)
+    check("reason: it names the move, the need and the confidence",
+          line.startswith(f"jev: opus -> {plan['model']} (need ") and
+          f"conf {plan['conf']}" in line, line)
+    check("reason: a reversible dispatch gets no warning bolted on",
+          "warning" not in line, line)
+    risky = copy.deepcopy(REAL["answers"])
+    risky["irreversible"]["noul"] = 0.94
+    warn = policy.decision_reason("opus", policy.decide(
+        risky, default="opus", tiers=["haiku", "sonnet", "opus"]))
+    check("reason: an irreversible one carries the warning and its score",
+          "irreversible 0.94" in warn and "not a gate" in warn, warn)
+    check("reason: a plan with no signals still renders",
+          "not a gate" in policy.decision_reason(
+              "opus", {"model": "haiku", "need": 0, "conf": 0,
+                       "advice": {"confirm": True}}), "")
+
+    # --- probe.py: unreachable is a third answer, not 'not served' -----------
+    import probe  # noqa: PLC0415 -- only this block needs it
+
+    def post_raising(exc):
+        def urlopen(req, timeout=None):
+            raise exc
+        with patched(probe.urllib.request, "urlopen", urlopen):
+            return probe.post("https://example.invalid", {}, {})
+
+    gone, _ = post_raising(urllib.error.HTTPError(
+        "u", 404, "Not Found", {}, io.BytesIO(b"no such model")))
+    check("probe: a 404 is a tier that is not served", gone is False, gone)
+    served, _ = post_raising(urllib.error.HTTPError(
+        "u", 400, "Bad Request", {}, io.BytesIO(b"bad body")))
+    check("probe: a 400 reached a model, so the tier is served",
+          served is True, served)
+    # The regression: this used to be False, and main() wrote the tier off.
+    for name, exc in (("a timeout", socket.timeout("timed out")),
+                      ("a dead network", urllib.error.URLError("no route"))):
+        unknown, why = post_raising(exc)
+        check(f"probe: {name} is unknown, not absent",
+              unknown is None, f"{unknown} {why}")
+
+    # --- the transcript tail reader ------------------------------------------
+    from providers import claude as claude_provider  # noqa: PLC0415
+
+    tail_file = tmp / "transcript.jsonl"
+    turns = [json.dumps({"type": "assistant", "message": {"model": m}})
+             for m in ["claude-haiku-4-5"] * 5000 + ["claude-opus-5"]]
+    tail_file.write_text("\n".join(turns) + "\n")
+    check("tail: the newest assistant turn wins over 5,000 older ones",
+          claude_provider.session_tier(str(tail_file)) == "opus")
+    for name, raw in (("an empty file", ""), ("one line, no newline", '{"a":1}'),
+                      ("a blank line", "\n"), ("trailing newlines", "a\nb\n")):
+        p = tmp / "edge.jsonl"
+        p.write_text(raw)
+        check(f"tail: {name} reads the same as splitlines() did",
+              claude_provider._tail(str(p), 200) == raw.splitlines(),
+              claude_provider._tail(str(p), 200))
+    check("tail: a file that is not there is None, not an empty tail",
+          claude_provider._tail(str(tmp / "absent.jsonl"), 10) is None)
+
+    # --- detail(): no criterion beside a score it did not produce ------------
+    with patched(policy, "system_one", lambda *a, **k: copy.deepcopy(REAL)):
+        scored = route.route_one({"id": "shown", "task": TASK}, "opus", False)
+    shown = io.StringIO()
+    with contextlib.redirect_stdout(shown):
+        route.detail(scored, "opus")
+    check("detail: a record scored under these questions keeps its criteria",
+          "~ " in shown.getvalue() and "different question set"
+          not in shown.getvalue(), shown.getvalue()[-120:])
+    stale = copy.deepcopy(scored)
+    stale["jev"]["questions"] = "0" * 12
+    hidden = io.StringIO()
+    with contextlib.redirect_stdout(hidden):
+        route.detail(stale, "opus")
+    check("detail: a record scored under others shows no criteria at all",
+          "different question set" in hidden.getvalue() and
+          "~ " not in hidden.getvalue(), hidden.getvalue()[-120:])
+
+    # --- replay.py: --all and --session are not quietly combined -------------
+    clash = subprocess.run(
+        [sys.executable, str(HERE / "replay.py"), "--all", "--session", "x"],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "JEV_DECISIONS_DIR": str(decisions.LOG_DIR)})
+    check("replay: --all with --session is refused, not silently widened",
+          clash.returncode != 0 and "drop --session" in
+          (clash.stderr + clash.stdout),
+          f"{clash.returncode} {(clash.stderr or clash.stdout)[-90:]}")
+
+    # --- install.py: the mod and the hook are not both left running ----------
+    import install  # noqa: PLC0415
+
+    reg = tmp / "installed_plugins.json"
+    with patched(install, "INSTALLED_PLUGINS", reg):
+        reg.write_text(json.dumps({"version": 2, "plugins": {}}))
+        check("install: no plugins on record means no warning",
+              install.mod_installed() is False)
+        reg.write_text(json.dumps({"version": 2, "plugins": {
+            "jev-router@somewhere-else": [{"scope": "user"}]}}))
+        check("install: the mod is spotted under any marketplace",
+              install.mod_installed() is True)
+        reg.write_text(json.dumps({"version": 2, "plugins": {
+            "renamed@mkt": [{"installPath": str(install.HERE)}]}}))
+        check("install: and under a rename, by the path it was installed from",
+              install.mod_installed() is True)
+        reg.write_text("{ not json")
+        check("install: an unreadable registry warns about nothing",
+              install.mod_installed() is False)
+
     width = max(len(n) for n, _, _ in cases)
     failed = 0
     for name, ok, detail in cases:
