@@ -410,28 +410,36 @@ def main() -> None:
     # `except ValueError` that used to wrap it could never fire.
     taus = parse_tau(args.tau)
 
+    # Every flag clash is settled here, above the first read off disk. A
+    # command refused for how it was typed should say so before it reports on
+    # the state of the log -- `--all --session x` on an empty log dir used to
+    # answer "Nothing recorded yet", which is true and is not the problem.
+    #
+    # Refused rather than ignored: --all would quietly include every other
+    # session alongside the one named, and --sweep sets the bar itself, one
+    # line per value. A table with more rows than you asked for, or answering
+    # a bar you did not type, is not obviously a table answering a different
+    # question.
+    if args.all and args.session:
+        raise SystemExit("--all reads every session; drop --session")
+    if args.sweep and args.tau:
+        raise SystemExit("--sweep sets tau itself; drop --tau")
+    if args.sweep and args.json:
+        # --sweep has its own renderer and never consults args.json, so asking
+        # for both silently printed the human table. Same defect as the two
+        # above, one flag over.
+        raise SystemExit("--sweep prints its own table; it has no --json form")
+
     known = decisions.sessions()
     if not known:
         raise SystemExit(
             "Nothing recorded yet. Either front end writes one entry per\n"
             "dispatch, so this fills up on its own.")
 
-    if args.all and args.session:
-        # Refused rather than ignored, the same way --sweep refuses --tau
-        # below: --all would quietly include every other session alongside the
-        # one named, and a table with more rows than you asked for is not
-        # obviously a table answering a different question.
-        raise SystemExit("--all reads every session; drop --session")
-
     picked = ([s["session"] for s in known] if args.all
               else [args.session or known[0]["session"]])
 
     if args.sweep:
-        if args.tau:
-            # --sweep sets the bar itself, one line per value. Silently
-            # ignoring the bar you asked for would print a table that answers
-            # a different question than the one on the command line.
-            raise SystemExit("--sweep sets tau itself; drop --tau")
         every = [r for s in picked for r in decisions.read(s)]
         sweep(every, args.up_bar)
         return

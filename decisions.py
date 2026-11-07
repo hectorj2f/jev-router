@@ -43,9 +43,10 @@ LOG_DIR = pathlib.Path(os.environ.get("JEV_DECISIONS_DIR")
 RETENTION = 7 * 24 * 3600
 
 # Enough to read the dispatch back and see what was scored, not enough to
-# replay it byte for byte. A dispatch prompt runs to the 60k state limit and
-# fifty of those is a log nobody opens twice. The original length is recorded
-# alongside, so a short task and a cut one stay distinguishable.
+# replay it byte for byte. What arrives here is uncut -- policy.STATE_LIMIT
+# trims what is sent to Jev, not what route.py hands the log -- and fifty
+# unbounded prompts is a log nobody opens twice. The original length is
+# recorded alongside, so a short task and a cut one stay distinguishable.
 TASK_LIMIT = 4_000
 
 # The session id arrives from outside and lands in a filename.

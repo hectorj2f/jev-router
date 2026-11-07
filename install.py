@@ -155,9 +155,18 @@ def mod_installed() -> bool:
         entries = json.loads(INSTALLED_PLUGINS.read_text())["plugins"]
     except (OSError, ValueError, KeyError, TypeError):
         return False
+    # Checked here rather than left to the `.items()` below, which is evaluated
+    # inside the generator and so outside the try above -- `{"plugins": []}`
+    # raised AttributeError straight through this function and out of
+    # claude_main, aborting the install before the hook was written. A warning
+    # printed beside an install must not be able to stop one.
+    if not isinstance(entries, dict):
+        return False
     # Keyed `<plugin>@<marketplace>`, and the marketplace is whatever the user
-    # added this clone under, so match on the plugin half. installPath catches
-    # it under a renamed plugin, which is the likelier of the two to be hit.
+    # added this clone under, so match on the plugin half. The installPath arm
+    # is for a clone loaded from source; every entry a marketplace install
+    # writes points into ~/.claude/plugins/cache, so on this machine it is the
+    # name that matches and the path that never does.
     return any(key.split("@")[0] == name
                or any(str(i.get("installPath")) == str(HERE)
                       for i in val if isinstance(i, dict))

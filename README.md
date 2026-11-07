@@ -165,20 +165,32 @@ have used, and the hook can't catch that because it happens after the hook
 returns. So measure once and record it:
 
 ```
-provider     vertex
+endpoint     vertex
   haiku    SKIP  unpinned; set ANTHROPIC_DEFAULT_HAIKU_MODEL to use this tier
   sonnet   GONE  claude-sonnet-4@20250514  -- HTTP 404 Publisher model ... not found
   opus     OK    claude-opus-5
 
 ladder       opus
+recorded     cache/tiers.json
+
+Fewer than two tiers means there is nothing to route between -- the hook
+will leave every dispatch alone. Grant or pin another model, or set
+JEV_TIERS if you know better than this probe.
 ```
 
 There is a fourth verdict, `????`, for a tier the probe could not reach at all
 — a timeout, a dead resolver, a missing credential. That is not the same fact
 as `GONE`, and conflating the two is expensive in one direction only: a tier
 written off on a network blip stays off the recorded ladder until someone
-thinks to probe again. So a run with any `????` in it records nothing and
-leaves the previous measurement alone.
+thinks to probe again.
+
+So what a run with any `????` in it does depends on whether there is anything
+to protect. With a record already on file it writes nothing and keeps it,
+since the previous measurement is better evidence than a half-finished one.
+With no record at all there is no previous measurement to leave alone, and no
+record reads as the full ladder — so it records the tiers that did confirm,
+which is narrower than the fallback it would otherwise fall back to. Either
+way it exits non-zero and says to re-run.
 
 Claude Code resolves each tier alias through `ANTHROPIC_DEFAULT_<TIER>_MODEL`,
 falling back to a built-in ID when unset — always valid on the first-party API,
@@ -210,12 +222,22 @@ export JEV_TIERS=sonnet,opus
 ```
 
 Every name in it has to be a rung of the ladder in play, or the whole variable
-is ignored, loudly, and the probe record is used instead. Honouring the half
-that parsed is how `JEV_TIERS=haiku,sonet` used to mean "haiku only" — every
-dispatch to the cheapest rung, off one transposed letter, with nothing said.
-The same applies to a `JEV_TIERS` written for one host and left exported into
-the other: `sonnet,opus` is not a codex ladder, and is better refused than
-read as an empty one.
+is ignored, loudly. Honouring the half that parsed is how
+`JEV_TIERS=haiku,sonet` used to mean "haiku only" — every dispatch to the
+cheapest rung, off one transposed letter, with nothing said. The same applies
+to a `JEV_TIERS` written for one host and left exported into the other:
+`sonnet,opus` is not a codex ladder, and is better refused than read as an
+empty one.
+
+What happens after the refusal depends on what else is on file. A probe record
+is used if there is one — it is a measurement, and the rejected variable was
+not. With no record there is nothing measured to fall back to, and the
+un-probed default is the full ladder, which would answer the one input that
+said "these are the tiers I have" with the widest possible guess. So a
+rejected `JEV_TIERS` and no record disables routing instead: every decision
+clamps to the model the session is already on, which costs the saving and
+nothing else. An *unset* `JEV_TIERS` is a different thing and still gets the
+full ladder.
 
 A one-tier ladder is a working state, not an error — there's nothing to route
 between, so the hook leaves every dispatch alone. So is no ladder at all: with
@@ -260,7 +282,10 @@ Route a single task and see the whole decision:
 
 From inside Claude Code the mod spells the same thing `/jev-route <task>`,
 defaulting to the tier the session is already on rather than asking you to
-name it.
+name it — unless the session is on a model that is not a rung of the ladder,
+in which case it passes no default at all and lets `route.py` pick its own.
+Naming a tier the active ladder does not have is rejected by the argument
+parser, which would turn an explain command into a traceback.
 
 That one output is the whole policy: Jev reads the task as small, the gate
 refuses the downgrade anyway because it is unsure (confidence 0.00) and the
@@ -506,7 +531,7 @@ the decision and runs the hook by path, so nothing is sent anywhere:
 
 ```bash
 ./selftest_codex.py                                      # 29/29
-./selftest_route.py                                      # 91/91
+./selftest_route.py                                      # 136/136
 ```
 
 `selftest_route.py` covers the plumbing under every front end, also offline:
@@ -515,6 +540,12 @@ into one catchable error; that it asks for the pinned version; that the cache
 is keyed on that version and never stores an answer missing a field; and that
 one bad shard in a `route.py` fan-out costs that shard, not the whole run.
 Its fixture is a real `jev-1.14.0` answer rather than an invented one.
+
+It also drives `hook_agent.py` the way Claude Code drives it — as a process,
+over stdin, against a real transcript file — rather than by calling `main()`.
+Calling `main()` would test a function no host ever invokes, and until these
+cases existed the whole Claude Code hook was unexercised, including the one
+sentence it is allowed to say about a decision.
 
 The `replay.py` cases hold that fixture to arithmetic done by hand — the 25
 cells of the outer product summing to `.1822/.7953/.0225` — so that moving a
@@ -820,7 +851,7 @@ it is not a Codex quirk. What both do now carry is the warning itself, on the
 `permissionDecisionReason` they already send on a dispatch they re-tier:
 
 ```
-jev: opus -> sonnet (need 0.37, conf 0.7); writes outside the working tree
+jev: opus -> sonnet (need 0.373, conf 0.7); writes outside the working tree
 (irreversible 0.94) -- a warning, not a gate
 ```
 
@@ -913,12 +944,14 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `routed-fanout.workflow.js` | Claude Code workflow running one agent per routed shard |
 | `selftest.py` | drives the Claude hook with synthetic events; asserts routing and every fail-open path |
 | `selftest_codex.py` | the same for `hook_codex.py`, with the decision pinned so it needs no key |
-| `selftest_route.py` | the Jev client, the cache, the fan-out and the decision log, offline, against a real recorded answer |
+| `selftest_route.py` | the Jev client, the cache, the fan-out, the decision log and `hook_agent.py`, offline, against a real recorded answer |
 | `tests/register.test.ts` | the same assertions against the mod, with `route.py` stood in for. The harness needs 2.1.287+ and has never run; the two line builders it asserts on are exported and have been driven directly |
 | `verify.py` | reads subagent transcripts and reports the model each one actually ran on |
 | `verify_codex.py` | the same against Codex rollouts, joined to the decision log by `task_name`, one verdict per dispatch |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
 | `experiments/context_dilution.py` | whether session context in the state helps the router or buries the task |
+| `.gitignore` | keeps `cache/` out of the repo: it is memoized Jev answers, keyed by the text of real tasks |
+| `README.md` | this file |
 | `LICENSE` | Apache-2.0 |
 
 ## Related work

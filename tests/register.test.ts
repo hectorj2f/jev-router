@@ -329,15 +329,17 @@ test('a dispatch is never denied', async ($, on) => {
   expect(result.model).toBe(PARENT)
 })
 
-test('a task past the state limit is truncated', async ($, on) => {
-  // Jev charges for input, and a dispatch prompt this long is a pathological
-  // case rather than a task description.
+test('a long task reaches route.py uncut', async ($, on) => {
+  // The cap is policy.STATE_LIMIT, applied once in policy.ask_meta. This file
+  // used to assert the mod did its own 60_000 cut -- a fourth copy of that
+  // number, and the only one the de-duplication missed, because there is no
+  // package.json here and nothing runs it.
   const { runs } = stub(on)
 
   await $.agent.spawn(dispatch({ prompt: 'x'.repeat(70_000) }))
 
   const sent = JSON.parse(runs[0].stdin ?? '')
-  expect(sent[0].task).toHaveLength(60_000)
+  expect(sent[0].task).toContain('x'.repeat(70_000))
 })
 
 test('a missing description and type still make a scorable state', async ($, on) => {

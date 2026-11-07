@@ -97,10 +97,24 @@ def detail(r: dict, default: str) -> None:
     # file. explain.py renders logged decisions through here, and a criterion
     # that never produced the score beside it is a caption inventing its own
     # photograph -- the same incomparability replay.py refuses a record over,
-    # one level quieter. A record with no hash predates schema 2 and cannot
-    # claim it either.
-    same_questions = ((r.get("jev") or {}).get("questions")
-                      == policy.QUESTIONS_HASH)
+    # one level quieter.
+    #
+    # Three states, not two: a record with no hash at all predates schema 2 and
+    # never said which questions produced its scores, which is not the same
+    # claim as having been scored under different ones. replay.py already keeps
+    # those apart ("schema 1: no answer kept" vs the mismatch), and saying the
+    # stronger thing here would be the unknown-vs-absent conflation this same
+    # PR took out of probe.py.
+    hash_seen = (r.get("jev") or {}).get("questions")
+    same_questions = hash_seen == policy.QUESTIONS_HASH
+    caveat = ("" if same_questions else
+              "scored under a different question set" if hash_seen else
+              "this record does not say which questions produced these scores")
+    # Above the two it qualifies, not below: printed after `breadth` it sat
+    # directly on top of mechanical/irreversible/ambiguous, which have no
+    # criteria to show and were never what it was about.
+    if caveat:
+        print(f"    ({caveat}; criteria not shown)")
     for name in ("depth", "breadth"):
         v = r["signals"][name]
         criteria = policy.QUESTIONS[name]["criteria"]
@@ -108,9 +122,11 @@ def detail(r: dict, default: str) -> None:
         # nearest criterion is an approximation of a value that sits between two.
         gloss = (f"  ~ {criteria[round(v)][:58]}"
                  if same_questions and 0 <= round(v) < len(criteria) else "")
-        print(f"    {name:<13}{v:>5.2f}/{len(criteria) - 1}{gloss}")
-    if not same_questions:
-        print("    (scored under a different question set; criteria not shown)")
+        # The denominator comes from the current questions too, so it is only
+        # the record's own scale while the hash matches. Both sets happen to
+        # have five levels today, which is exactly why it needs saying.
+        outof = f"/{len(criteria) - 1}" if same_questions else ""
+        print(f"    {name:<13}{v:>5.2f}{outof}{gloss}")
     for name in ("mechanical", "irreversible", "ambiguous"):
         print(f"    {name:<13}{r['signals'][name]:>5.2f}")
 

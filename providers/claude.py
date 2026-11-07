@@ -55,24 +55,38 @@ def _tail(path: str, n: int) -> list[str] | None:
 
     Seeking backward rather than reading the whole thing, because a transcript
     is append-only and grows for the life of a session while the two readers
-    below want a fixed couple of hundred lines off the end. Measured against a
+    below want a fixed couple of hundred lines off the end. Measured against the
     169 MB transcript on this machine, `read_text().splitlines()` cost 1,151 MB
-    of peak RSS and 0.3s -- per dispatch, in a separate process per concurrent
-    dispatch, to look at 200 lines. Reading 64 KB at a time off the end instead
-    returns the same answer in 18 MB and 1 ms.
+    of peak RSS and 0.3s to look at 200 lines -- per dispatch, in a separate
+    process per concurrent dispatch. Seeking costs 1 ms at n=200 and 4 ms at the
+    n=400 `last_user_prompt` wants. Peak RSS lands at 18 MB, but nearly all of
+    that is bare interpreter: the read itself is about 2 MB.
     """
+    if n <= 0:
+        return []  # `lines[-0:]` is the whole file, which is not "the last none"
     try:
         with open(path, "rb") as f:
             pos = f.seek(0, io.SEEK_END)
-            buf = b""
-            while pos > 0 and buf.count(b"\n") <= n:
+            # Collected and joined once at the end. Prepending each block to an
+            # accumulator instead -- `buf = f.read(step) + buf` -- recopies
+            # everything read so far on every pass, which is quadratic in the
+            # bytes read and so only cheap while the tail is short. The loop
+            # stops on a newline count, not a byte count, so a transcript of few
+            # but very large records reads the whole file that way: over 32 MB
+            # that cost 3.7s and 2.0 GB, against 27 ms for the whole-file read
+            # this replaced. Joining once makes the same case 22 ms and 87 MB.
+            chunks, seen = [], 0
+            while pos > 0 and seen <= n:
                 step = min(65536, pos)
                 pos -= step
                 f.seek(pos)
-                buf = f.read(step) + buf
+                block = f.read(step)
+                seen += block.count(b"\n")
+                chunks.append(block)
     except OSError:
         return None
 
+    buf = b"".join(reversed(chunks))
     if not buf:
         return []  # before the strip below: b"\n" is one empty line, b"" is none
     # splitlines() drops a trailing newline; split() would leave an empty
@@ -80,15 +94,24 @@ def _tail(path: str, n: int) -> list[str] | None:
     if buf.endswith(b"\n"):
         buf = buf[:-1]
     lines = buf.split(b"\n")
-    # Unless the whole file was read, the first element is the tail of a line
-    # whose start is in a block that was never read -- and may begin mid
+    # Unless the whole file was read, the first element may be the tail of a
+    # line whose start is in a block that was never read -- and may begin mid
     # codepoint, which is the other reason it goes rather than being decoded.
+    # Dropped unconditionally rather than tested, because a block boundary that
+    # happens to land just after a newline makes it a whole line: the loop exits
+    # only once it holds n+1 newlines, so `lines[-n:]` cannot reach the first
+    # element either way, and discarding a whole one costs nothing.
     if pos > 0:
         lines = lines[1:]
-    # Only `\n` and `\r\n`, where str.splitlines() also breaks on \v, \f and
-    # U+2028. That difference is deliberate and in the safe direction: those
-    # are legal inside a JSON string, so splitting on one tore a record in half
-    # and lost it, where keeping it whole parses.
+    # Splits on `\n` alone, stripping one trailing `\r`. str.splitlines() also
+    # breaks on \v, \f, \x1c, \x1d, \x1e, a lone \r, U+0085, U+2028 and U+2029 --
+    # and the old reader opened in text mode, so universal newlines collapsed a
+    # lone \r before splitlines() ever saw it. None of the nine appears in any
+    # of the 514 transcripts on this machine. RFC 8259 forbids a raw C0 control
+    # inside a string and Node's JSON.stringify escapes them, so a record
+    # carrying one is unparseable whether it is split or not; of the three that
+    # could legally appear -- U+0085, U+2028, U+2029 -- not splitting is the
+    # direction that keeps the record whole.
     return [line.decode(errors="replace").removesuffix("\r") for line in lines[-n:]]
 
 

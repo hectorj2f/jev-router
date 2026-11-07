@@ -113,7 +113,7 @@ def retry_after(header: str | None, fallback: float) -> float:
 
 
 def system_one(
-    state, questions: dict, model: str | None = None, timeout: float = 30.0,
+    state: str, questions: dict, model: str | None = None, timeout: float = 30.0,
     budget: float = BUDGET,
 ) -> dict:
     """One POST to /v1/systemone, with backoff on the two retryable statuses.
@@ -131,8 +131,7 @@ def system_one(
     that no caller can reach the API over the documented cap.
     """
     model = model or model_name()
-    if isinstance(state, str):
-        state = state[:STATE_CHAR_LIMIT]
+    state = state[:STATE_CHAR_LIMIT]
     body = json.dumps({"state": state, "model": model, "questions": questions})
     req = urllib.request.Request(
         ENDPOINT,

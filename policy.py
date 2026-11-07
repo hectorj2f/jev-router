@@ -34,10 +34,12 @@ CACHE_TTL = 7 * 24 * 3600
 # prompt past this is a pathological case rather than a task description.
 #
 # Enforced in ask_meta, which every routing path reaches, because it was
-# previously enforced by each caller instead: hook_agent.py, hook_codex.py and
-# hooks/register.js each spelled this number, jev.py spelled a fourth one it
-# applied only to its own CLI, and route.py -- the fan-out, and the one the mod
-# shells out to -- applied none of them and sent whatever it was handed.
+# previously enforced by each caller instead: hook_agent.py, hook_codex.py,
+# hooks/register.js and an assertion in tests/register.test.ts each spelled
+# this number, while route.py -- the fan-out, and the one the mod shells out
+# to -- applied no cap at all and sent whatever it was handed. jev.py's
+# STATE_CHAR_LIMIT is a different number answering a different question; see
+# the comment there.
 STATE_LIMIT = 60_000
 
 # Atomic questions rather than one "which model" choice. Which tier a task
@@ -144,6 +146,7 @@ def available_tiers(provider: types.ModuleType | None = None) -> list[str]:
     prov = provider if provider is not None else PROVIDER
     ladder = prov.TIERS
 
+    rejected = False
     explicit = os.environ.get("JEV_TIERS", "").strip()
     if explicit:
         want = [t.strip() for t in explicit.split(",") if t.strip()]
@@ -152,16 +155,14 @@ def available_tiers(provider: types.ModuleType | None = None) -> list[str]:
             return [t for t in ladder if t in want]
         # Honouring the half that parsed is how `JEV_TIERS=haiku,sonet` quietly
         # became "haiku only" -- every dispatch to the cheapest rung, off one
-        # transposed letter, with nothing said. The old `or list(ladder)` was
-        # the same failure in the other direction: a wholly misspelled list
-        # read as "the full ladder", which is the fallback the probe branch
-        # below refuses by name.
+        # transposed letter, with nothing said.
         #
         # A list that does not describe this ladder is not about this ladder.
         # It is a typo, or it is another provider's rungs still exported in
         # the shell -- hook_codex.py sets JEV_PROVIDER itself, so a JEV_TIERS
         # written for Claude reaches the codex ladder intact. Say so, and fall
         # through to something measured rather than guess which half was meant.
+        rejected = True
         print(f"jev: ignoring JEV_TIERS={explicit!r}: "
               f"{', '.join(unknown) or 'no tier names in it'} -- the "
               f"{prov.NAME} ladder is {', '.join(ladder)}", file=sys.stderr)
@@ -183,7 +184,13 @@ def available_tiers(provider: types.ModuleType | None = None) -> list[str]:
         rec = json.loads(_tiers_file(prov).read_text())
         recorded, resolved = rec["tiers"], rec.get("resolved", {})
     except (OSError, json.JSONDecodeError, KeyError):
-        return list(ladder)
+        # The un-probed default is the full ladder -- but only for someone who
+        # never claimed to know better. After a rejected JEV_TIERS it would be
+        # the widest possible answer to the one input that said "these are the
+        # tiers I have", and the docstring above calls emitting an unserved
+        # tier the worst outcome there is. Empty disables routing in decide(),
+        # which costs the saving and nothing else.
+        return [] if rejected else list(ladder)
 
     out = []
     for t in ladder:
