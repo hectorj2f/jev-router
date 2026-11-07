@@ -405,16 +405,23 @@ def main() -> None:
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
 
-    try:
-        taus = parse_tau(args.tau)
-    except ValueError as e:
-        raise SystemExit(f"--tau: {e}") from e
+    # No try/except around this: parse_tau and a_bar raise SystemExit, already
+    # carrying the `--tau ...` prefix a handler here would have added, so the
+    # `except ValueError` that used to wrap it could never fire.
+    taus = parse_tau(args.tau)
 
     known = decisions.sessions()
     if not known:
         raise SystemExit(
             "Nothing recorded yet. Either front end writes one entry per\n"
             "dispatch, so this fills up on its own.")
+
+    if args.all and args.session:
+        # Refused rather than ignored, the same way --sweep refuses --tau
+        # below: --all would quietly include every other session alongside the
+        # one named, and a table with more rows than you asked for is not
+        # obviously a table answering a different question.
+        raise SystemExit("--all reads every session; drop --session")
 
     picked = ([s["session"] for s in known] if args.all
               else [args.session or known[0]["session"]])

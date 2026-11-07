@@ -147,7 +147,7 @@ the right-hand column's position without needing a mod at all:
 | is this a fork | inferred from `subagent_type` | `e.fork` | `fork_turns` / `fork_context` |
 | did the caller pick a model | read out of the raw tool input | `e.model` | `tool_input.model` |
 | agent-team teammates | never seen — they aren't `Agent` tool calls | routed, same as any dispatch | n/a |
-| the `confirm` advice | reachable only on a dispatch it already re-tiers | printed at spawn, always | same as `hook_agent.py`; [see below](#the-advice-half-mostly-unbuilt) |
+| the `confirm` advice | on the reason line, so only where it re-tiers | printed at spawn, always | same as `hook_agent.py`; [see below](#the-advice-half-mostly-unbuilt) |
 
 It also carries three commands — `/jev-probe`, `/jev-route` and
 `/jev-explain` — which are the next three sections.
@@ -166,12 +166,19 @@ returns. So measure once and record it:
 
 ```
 provider     vertex
-  haiku    SKIP    unpinned; set ANTHROPIC_DEFAULT_HAIKU_MODEL to use this tier
-  sonnet   GONE    claude-sonnet-4@20250514  -- HTTP 404 Publisher model ... not found
-  opus     OK      claude-opus-5
+  haiku    SKIP  unpinned; set ANTHROPIC_DEFAULT_HAIKU_MODEL to use this tier
+  sonnet   GONE  claude-sonnet-4@20250514  -- HTTP 404 Publisher model ... not found
+  opus     OK    claude-opus-5
 
 ladder       opus
 ```
+
+There is a fourth verdict, `????`, for a tier the probe could not reach at all
+— a timeout, a dead resolver, a missing credential. That is not the same fact
+as `GONE`, and conflating the two is expensive in one direction only: a tier
+written off on a network blip stays off the recorded ladder until someone
+thinks to probe again. So a run with any `????` in it records nothing and
+leaves the previous measurement alone.
 
 Claude Code resolves each tier alias through `ANTHROPIC_DEFAULT_<TIER>_MODEL`,
 falling back to a built-in ID when unset — always valid on the first-party API,
@@ -201,6 +208,14 @@ probeable this way; declare it yourself. Either way `JEV_TIERS` wins:
 ```bash
 export JEV_TIERS=sonnet,opus
 ```
+
+Every name in it has to be a rung of the ladder in play, or the whole variable
+is ignored, loudly, and the probe record is used instead. Honouring the half
+that parsed is how `JEV_TIERS=haiku,sonet` used to mean "haiku only" — every
+dispatch to the cheapest rung, off one transposed letter, with nothing said.
+The same applies to a `JEV_TIERS` written for one host and left exported into
+the other: `sonnet,opus` is not a codex ladder, and is better refused than
+read as an empty one.
 
 A one-tier ladder is a working state, not an error — there's nothing to route
 between, so the hook leaves every dispatch alone. So is no ladder at all: with
@@ -490,8 +505,8 @@ The Codex hook has its own suite, which needs no key at all — every case pins
 the decision and runs the hook by path, so nothing is sent anywhere:
 
 ```bash
-./selftest_codex.py                                      # 27/27
-./selftest_route.py                                      # 61/61
+./selftest_codex.py                                      # 29/29
+./selftest_route.py                                      # 91/91
 ```
 
 `selftest_route.py` covers the plumbing under every front end, also offline:
@@ -800,12 +815,20 @@ those versions actually ship is unverified either way. **Read the declarations
 for the version in front of you before writing this**, and treat a field the
 docs promise as unavailable until you have seen it declared.
 
-Neither hook gets this, and the reason is the same on both — it is not a Codex
-quirk. Both carry a message to the user in `permissionDecisionReason`, and
-both already send one on a dispatch they re-tier, so adding the warning there
-would cost a few characters on a string already in flight. On Codex that
-object additionally needs `permissionDecision: "allow"`, or it is discarded
-along with the `updatedInput` it came with.
+Neither hook gets the confirmation step, and the reason is the same on both —
+it is not a Codex quirk. What both do now carry is the warning itself, on the
+`permissionDecisionReason` they already send on a dispatch they re-tier:
+
+```
+jev: opus -> sonnet (need 0.37, conf 0.7); writes outside the working tree
+(irreversible 0.94) -- a warning, not a gate
+```
+
+That is `policy.decision_reason`, shared rather than written out in each hook,
+since the line was already duplicated and the warning was missing from both
+copies. On Codex the object carrying it additionally needs
+`permissionDecision: "allow"`, or it is discarded along with the
+`updatedInput` it came with.
 
 The half that cannot be had is the half that matters. When the decision
 changes nothing, both hooks return silently with no output at all, and warning
@@ -875,12 +898,15 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `providers/` | what differs per host: the ladder, the slugs, the effort each rung takes, and how to find out which rungs are served. `claude.py` also holds the two transcript readers, which have no Codex counterpart |
 | `jev.py` | zero-dependency client for `POST /v1/systemone`; backs off on 429/529, normalises confidence across all three primitives (`noul` returns none, so it computes `\|2p − 1\|`) |
 | `hooks/register.js` | the mod: routes `agent.spawn`, and serves `/jev-probe`, `/jev-route` and `/jev-explain`. The recommended entry point, on 2.1.287+ |
+| `hooks/hooks.json` | the one line that points Claude Code at `register.js`. Plugin-relative, which is why it is not the file `--codex` writes |
+| `.claude-plugin/` | `plugin.json` and `marketplace.json` — what `claude plugin marketplace add ~/jev-router` reads to find the mod |
 | `hook_agent.py` | the Claude Code `PreToolUse` hook. The entry point below 2.1.287 |
 | `hook_codex.py` | the Codex `PreToolUse` hook on `spawn_agent`. The entry point there |
 | `codex/hooks.json` | the hook declaration, ready to copy into `~/.codex/` by hand |
 | `install.py` | registers/removes the hook in `~/.claude/settings.json`, or in `~/.codex/hooks.json` with `--codex`. Backs up before every write |
 | `probe.py` | pings each tier alias to find which ones the endpoint will actually serve |
 | `route.py` | maps the policy over a list of tasks, concurrently, failing open to the default on a Jev error |
+| `examples/shards.json` | a fan-out to pipe into `./route.py`, so the stdin form has something to try |
 | `decisions.py` | the append-only decision log, one JSONL file per session. Written by all three front ends, including the decisions that changed nothing |
 | `explain.py` | reads the log back: the session as a table, then everything behind any one row |
 | `replay.py` | recomputes logged dispatches under a different downgrade gate, offline. Measures; routes nothing |
@@ -893,6 +919,7 @@ cache/decisions` ends it; `JEV_DECISIONS_DIR` moves it somewhere you control.
 | `verify_codex.py` | the same against Codex rollouts, joined to the decision log by `task_name`, one verdict per dispatch |
 | `compare.py` / `shardcmp.py` | the measurement harnesses behind the numbers above |
 | `experiments/context_dilution.py` | whether session context in the state helps the router or buries the task |
+| `LICENSE` | Apache-2.0 |
 
 ## Related work
 

@@ -16,10 +16,6 @@
  * policy -- run one or the other, not both (`./install.py --uninstall`).
  */
 
-// Mirrors hook_agent.py. Jev charges for input, and a dispatch prompt past this
-// is a pathological case rather than a task description.
-const STATE_LIMIT = 60_000
-
 // Mirrors policy.TIERS, and the order matters: this is a substring match
 // against a resolved model id, the same way policy.session_tier reads one.
 const TIERS = ['haiku', 'sonnet', 'opus']
@@ -165,11 +161,15 @@ export function register(on) {
     const parent = tierOf(e.parentModel)
     if (!parent) return next(e)
 
+    // Not cut here. route.py applies policy.STATE_LIMIT, and this file used to
+    // carry its own copy of that number -- a fourth, alongside the two hooks
+    // and jev.py's. It travels over stdin, so there is no argv ceiling to
+    // respect either.
     const state = [
       `Agent type: ${e.subagentType || 'general-purpose'}`,
       `Description: ${e.description || ''}`,
       `Task:\n${e.prompt || ''}`,
-    ].join('\n').slice(0, STATE_LIMIT)
+    ].join('\n')
 
     const label = (e.description || e.subagentType || 'dispatch').slice(0, 48)
 
@@ -227,7 +227,10 @@ export function register(on) {
     // Default to the session's own tier for the same reason the hook does: the
     // gates are relative to it, so routing against anything else reads the
     // wrong half of the asymmetry.
-    const parent = tierOf(await $.session.model()) || 'sonnet'
+    // TIERS[1], not a literal 'sonnet'. route.py's --default carries the same
+    // comment for the same reason: a hardcoded rung name is the one thing on
+    // this path that cannot survive a ladder it is not a rung of.
+    const parent = tierOf(await $.session.model()) || TIERS[1]
     const run = await $.process.run(
       [`${$.plugin.root}/route.py`, '--default', parent, task],
       { timeoutMs: ROUTE_TIMEOUT_MS })

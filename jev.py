@@ -37,6 +37,13 @@ KEY_FILE = pathlib.Path.home() / ".typesafe" / "key"
 # The docs cap a request at 64k tokens total, and 32k for `state` plus the
 # longest single question. Four chars per token is the usual rough conversion;
 # this truncates well short of the cap rather than letting the API 422.
+#
+# A different number from policy.STATE_LIMIT and a different question. This one
+# is the API's ceiling and belongs to every caller of system_one, including the
+# CLI below; policy's is how much of a task is worth paying to score, and is
+# the smaller of the two, so on a routing path this never bites. It used to be
+# applied in main() alone, which left the ceiling unenforced on every path that
+# was not someone typing at a shell.
 STATE_CHAR_LIMIT = 100_000
 
 RETRYABLE = {429, 529}
@@ -119,8 +126,13 @@ def system_one(
     `budget` bounds the whole call, retries and sleeps included. Giving up
     inside it is what lets the caller log the outage; being killed by the host
     for overrunning is what used to make a rate-limited Jev invisible.
+
+    `state` is cut to STATE_CHAR_LIMIT here, where the request is built, so
+    that no caller can reach the API over the documented cap.
     """
     model = model or model_name()
+    if isinstance(state, str):
+        state = state[:STATE_CHAR_LIMIT]
     body = json.dumps({"state": state, "model": model, "questions": questions})
     req = urllib.request.Request(
         ENDPOINT,
@@ -204,8 +216,8 @@ def main() -> None:
         state = pathlib.Path(args.state_file).read_text()
     else:
         state = sys.stdin.read()
-    if len(state) > STATE_CHAR_LIMIT:
-        state = state[:STATE_CHAR_LIMIT]
+    # No truncation here: system_one applies STATE_CHAR_LIMIT itself now, for
+    # every caller rather than for this one.
 
     questions: dict = {}
     if args.questions_file:
