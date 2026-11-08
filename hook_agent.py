@@ -19,8 +19,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import decisions  # noqa: E402
 import policy  # noqa: E402
 
-STATE_LIMIT = 60_000
-
 
 def main() -> None:
     ev = json.load(sys.stdin)
@@ -48,7 +46,9 @@ def main() -> None:
         ev.get("transcript_path") or "").stem
     label = ti.get("description") or agent
     try:
-        plan = policy.route(state[:STATE_LIMIT], default=default)
+        # Uncut: policy.route applies policy.STATE_LIMIT, which this used to
+        # spell again here, as did hook_codex.py and the mod.
+        plan = policy.route(state, default=default)
     except (Exception, SystemExit) as e:
         # Both, and they arrive for different reasons: jev.py reports a missing
         # key or a dead API as SystemExit, which is not an Exception, while a
@@ -69,8 +69,7 @@ def main() -> None:
         return
 
     ti["model"] = plan["model"]
-    reason = (f"jev: {default} -> {plan['model']} "
-              f"(need {plan['need']}, conf {plan['conf']})")
+    reason = policy.decision_reason(default, plan)
     # updatedInput REPLACES the arguments rather than merging, so the whole
     # tool_input has to go back, not just the key being changed.
     json.dump({"hookSpecificOutput": {

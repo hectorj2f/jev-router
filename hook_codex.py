@@ -33,8 +33,6 @@ import decisions  # noqa: E402
 import policy  # noqa: E402
 from providers import codex  # noqa: E402
 
-STATE_LIMIT = 60_000
-
 
 def full_history_fork(ti: dict) -> bool:
     """Whether the child inherits the parent's whole conversation.
@@ -98,7 +96,9 @@ def main() -> None:
         ev.get("transcript_path") or "").stem
     label = ti.get("task_name") or agent
     try:
-        plan = policy.route(state[:STATE_LIMIT], default=default)
+        # Uncut: policy.route applies policy.STATE_LIMIT, which this used to
+        # spell again here, as did hook_agent.py and the mod.
+        plan = policy.route(state, default=default)
     except (Exception, SystemExit) as e:
         # Both, and they fall through to the one record() below, for the
         # reasons hook_agent.py gives: "could not reach Jev" and "held" both
@@ -127,8 +127,7 @@ def main() -> None:
     else:
         ti["reasoning_effort"] = effort
 
-    reason = (f"jev: {default} -> {plan['model']} "
-              f"(need {plan['need']}, conf {plan['conf']})")
+    reason = policy.decision_reason(default, plan)
     # updatedInput REPLACES the arguments rather than merging, so the whole
     # tool_input has to go back, not just the keys being changed. The
     # permissionDecision is what carries it: without `allow` Codex discards the

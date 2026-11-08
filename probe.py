@@ -60,7 +60,19 @@ def pinned(tier: str) -> str | None:
     return os.environ.get(claude.alias_env(tier))
 
 
-def post(url: str, body: dict, headers: dict) -> tuple[bool, str]:
+def post(url: str, body: dict, headers: dict,
+         model: str = "") -> tuple[bool | None, str]:
+    """True served, False not served, None could not be measured.
+
+    `model` is only read to tell the two meanings of a 403 apart; omitting it
+    reads every 403 as unmeasured, which is the safe direction.
+
+    The third state is the point. It used to be folded into False, under a
+    comment that identified the distinction exactly -- "unknown, not absent" --
+    and then discarded it, so main() wrote the tier down as GONE. One DNS blip
+    or one timeout permanently narrowed the recorded ladder, and nothing in
+    cache/tiers.json said it had happened.
+    """
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", **headers})
     try:
@@ -70,15 +82,36 @@ def post(url: str, body: dict, headers: dict) -> tuple[bool, str]:
         detail = e.read().decode(errors="replace")[:120].replace("\n", " ")
         # A 400 means the request reached a model that exists and disliked the
         # body -- which is all we are asking. Only "not found" rules a tier out.
-        return (e.code not in (403, 404), f"HTTP {e.code} {detail}")
-    except Exception as e:  # network, DNS, timeout -- unknown, not absent
-        return False, f"{type(e).__name__}: {e}"
+        if e.code == 404:
+            return False, f"HTTP 404 {detail}"
+        # A 403 is two different facts wearing one code. Vertex returns
+        # PERMISSION_DENIED both for "this project was never granted that model"
+        # -- a real answer -- and for "the caller lacks aiplatform.user" or "the
+        # API is off", which are about the machine. Only the first names the
+        # model, so only the first is read as an answer.
+        if e.code == 403:
+            return (False if model and model in detail else None,
+                    f"HTTP 403 {detail}")
+        # Everything else is unmeasured, not unserved. This branch used to be
+        # `e.code not in (403, 404)`, so an expired key (401), a proxy that
+        # wanted its own auth (407), a rate limit (429) or a bad gateway all
+        # recorded a fully-confirmed ladder nothing had confirmed -- while
+        # probe_anthropic right below returned None for an API key that was
+        # merely absent. The same fact about this machine, answered two ways.
+        if e.code in (401, 407, 429) or e.code >= 500:
+            return None, f"HTTP {e.code} {detail}"
+        return True, f"HTTP {e.code} {detail}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
 
 
-def probe_vertex(model: str) -> tuple[bool, str]:
+def probe_vertex(model: str) -> tuple[bool | None, str]:
+    # None, not False, on all three of these: a missing project, a gcloud that
+    # would not run and a missing token are facts about this machine, not about
+    # what Vertex serves.
     project = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
     if not project:
-        return False, "ANTHROPIC_VERTEX_PROJECT_ID unset"
+        return None, "ANTHROPIC_VERTEX_PROJECT_ID unset"
     region = os.environ.get("CLOUD_ML_REGION", "global")
     host = ("aiplatform.googleapis.com" if region == "global"
             else f"{region}-aiplatform.googleapis.com")
@@ -86,21 +119,21 @@ def probe_vertex(model: str) -> tuple[bool, str]:
         token = subprocess.run(["gcloud", "auth", "print-access-token"],
                                capture_output=True, text=True, timeout=30).stdout.strip()
     except Exception as e:
-        return False, f"gcloud: {e}"
+        return None, f"gcloud: {e}"
     if not token:
-        return False, "no gcloud access token (gcloud auth login)"
+        return None, "no gcloud access token (gcloud auth login)"
     url = (f"https://{host}/v1/projects/{project}/locations/{region}"
            f"/publishers/anthropic/models/{model}:rawPredict")
     return post(url, {"anthropic_version": "vertex-2023-10-16", **PING},
-                {"Authorization": f"Bearer {token}"})
+                {"Authorization": f"Bearer {token}"}, model)
 
 
-def probe_anthropic(model: str) -> tuple[bool, str]:
+def probe_anthropic(model: str) -> tuple[bool | None, str]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
-        return False, "ANTHROPIC_API_KEY unset"
+        return None, "ANTHROPIC_API_KEY unset"  # unmeasurable, not unserved
     return post("https://api.anthropic.com/v1/messages", {"model": model, **PING},
-                {"x-api-key": key, "anthropic-version": "2023-06-01"})
+                {"x-api-key": key, "anthropic-version": "2023-06-01"}, model)
 
 
 def main() -> int:
@@ -124,7 +157,7 @@ def main() -> int:
         return 1
 
     probe = {"vertex": probe_vertex, "anthropic": probe_anthropic}[prov]
-    good, resolved = [], {}
+    good, unknown, resolved = [], [], {}
 
     for tier in TIERS:
         model = pinned(tier)
@@ -135,14 +168,41 @@ def main() -> int:
                 print(f"  {tier:<8} assumed -- unpinned, and the first-party fallback is valid")
             else:
                 resolved[tier] = None
-                print(f"  {tier:<8} SKIP    unpinned; set ANTHROPIC_DEFAULT_{tier.upper()}_MODEL "
+                print(f"  {tier:<8} SKIP  unpinned; set ANTHROPIC_DEFAULT_{tier.upper()}_MODEL "
                       f"to use this tier")
             continue
         ok, why = probe(model)
         resolved[tier] = model
         if ok:
             good.append(tier)
-        print(f"  {tier:<8} {'OK ' if ok else 'GONE'}    {model}{'' if ok else f'  -- {why}'}")
+        elif ok is None:
+            unknown.append(tier)
+        verdict = "OK  " if ok else "????" if ok is None else "GONE"
+        print(f"  {tier:<8} {verdict}  {model}{'' if ok else f'  -- {why}'}")
+
+    if unknown and TIERS_FILE.is_file():
+        # The record this writes is read back as a ladder, and a tier absent
+        # from it is routed around. A tier we could not reach is not a tier
+        # that is not there, so the honest thing is to write nothing and keep
+        # whatever the last successful probe said -- the same stance the
+        # zero-confirmed case below takes, for the same reason.
+        print(f"\n{', '.join(unknown)} could not be reached, which is not the same "
+              f"as not being\nserved -- not recording, leaving the previous "
+              f"measurement in place.\nRe-run when whatever that was has cleared.")
+        return 1
+
+    if unknown and good:
+        # Nothing on file, so there is no previous measurement to leave in
+        # place -- and available_tiers() reads "no record at all" as the full
+        # ladder, which is wider than what was just measured and is the one
+        # direction this file exists to avoid. Recording the confirmed tiers is
+        # narrower than the fallback, and narrow costs a saving where wide
+        # costs an agent. Discarding them to return 1, as this used to, handed
+        # a first-time user on a flaky network the whole ladder instead.
+        print(f"\n{', '.join(unknown)} could not be reached, which is not the same as "
+              f"not being\nserved -- but there is no previous measurement to keep, and "
+              f"no record at\nall reads as the full ladder. Recording what did confirm; "
+              f"re-run when\nwhatever that was has cleared.")
 
     if not good:
         # Finding nothing is a failed measurement, not a measurement of
@@ -171,7 +231,12 @@ def main() -> int:
         print("\nFewer than two tiers means there is nothing to route between -- the hook\n"
               "will leave every dispatch alone. Grant or pin another model, or set\n"
               "JEV_TIERS if you know better than this probe.")
-    return 0
+    # Non-zero when a tier went unanswered, even though the confirmed ones were
+    # just written. The branch above returns 1 for the same incompleteness when
+    # there is a record to protect, and a probe that says "re-run when that has
+    # cleared" while exiting 0 is telling a script the opposite of what it just
+    # told the reader.
+    return 1 if unknown else 0
 
 
 if __name__ == "__main__":

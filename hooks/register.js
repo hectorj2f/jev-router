@@ -16,10 +16,6 @@
  * policy -- run one or the other, not both (`./install.py --uninstall`).
  */
 
-// Mirrors hook_agent.py. Jev charges for input, and a dispatch prompt past this
-// is a pathological case rather than a task description.
-const STATE_LIMIT = 60_000
-
 // Mirrors policy.TIERS, and the order matters: this is a substring match
 // against a resolved model id, the same way policy.session_tier reads one.
 const TIERS = ['haiku', 'sonnet', 'opus']
@@ -62,9 +58,16 @@ async function routeOne($, state, parent, label, session, dispatch) {
     { stdin: JSON.stringify([{ id: label, task: state, dispatch }]),
       timeoutMs: ROUTE_TIMEOUT_MS },
   )
-  if (run.exitCode !== 0) return null
+  // stderr is carried out rather than dropped. route.py writes warnings there
+  // -- a rejected JEV_TIERS is the one that matters, since it changes which
+  // rungs are reachable -- and this is the surface that routes every dispatch,
+  // so discarding it meant the warning only ever reached the three slash
+  // commands, which concatenate both streams.
+  const warning = run.stderr?.trim() || null
+  if (run.exitCode !== 0) return { warning, plan: null }
   const routed = JSON.parse(run.stdout)
-  return Array.isArray(routed) && routed.length === 1 ? routed[0] : null
+  const plan = Array.isArray(routed) && routed.length === 1 ? routed[0] : null
+  return { warning, plan }
 }
 
 /** The one line the decision is worth, or null when nothing was decided. */
@@ -165,11 +168,15 @@ export function register(on) {
     const parent = tierOf(e.parentModel)
     if (!parent) return next(e)
 
+    // Not cut here. route.py applies policy.STATE_LIMIT, and this file used to
+    // carry its own copy of that number -- one of four, with hook_agent.py,
+    // hook_codex.py and the assertion in tests/register.test.ts. It travels
+    // over stdin, so there is no argv ceiling to respect either.
     const state = [
       `Agent type: ${e.subagentType || 'general-purpose'}`,
       `Description: ${e.description || ''}`,
       `Task:\n${e.prompt || ''}`,
-    ].join('\n').slice(0, STATE_LIMIT)
+    ].join('\n')
 
     const label = (e.description || e.subagentType || 'dispatch').slice(0, 48)
 
@@ -186,12 +193,16 @@ export function register(on) {
     // policy.available_tiers, not anything here -- a 404 happens after the
     // hook has returned, where nothing can catch it.
     let plan = null
+    let warning = null
     try {
-      plan = await routeOne($, state, parent, label, String(await $.session.id()),
-        e.tool_use_id)
+      ;({ plan, warning } = await routeOne($, state, parent, label,
+        String(await $.session.id()), e.tool_use_id))
     } catch {
       return next(e)
     }
+    // Before the early return, so a misspelled JEV_TIERS is still heard on the
+    // dispatch it silently changed the ladder for.
+    if (warning) $.ui.log(warning)
     if (!plan) return next(e)
 
     const decided = decisionLine(plan, parent, label)
@@ -227,9 +238,17 @@ export function register(on) {
     // Default to the session's own tier for the same reason the hook does: the
     // gates are relative to it, so routing against anything else reads the
     // wrong half of the asymmetry.
-    const parent = tierOf(await $.session.model()) || 'sonnet'
+    //
+    // When the session model is off the ladder, --default is omitted entirely
+    // rather than filled in from TIERS: route.py defaults it to policy.TIERS[1],
+    // the middle rung of whatever ladder is actually active. Passing a name
+    // from the mod's own TIERS looked equivalent -- it is a hardcoded mirror of
+    // the Claude ladder, so TIERS[1] is the literal 'sonnet' either way -- but
+    // under JEV_PROVIDER=codex that reaches a route.py whose --default choices
+    // are luna, sol and astra, and argparse exits 2 with a usage error.
+    const parent = tierOf(await $.session.model())
     const run = await $.process.run(
-      [`${$.plugin.root}/route.py`, '--default', parent, task],
+      [`${$.plugin.root}/route.py`, ...(parent ? ['--default', parent] : []), task],
       { timeoutMs: ROUTE_TIMEOUT_MS })
     const out = `${run.stdout}${run.stderr}`.trim()
     return { text: out || `route.py exited ${run.exitCode} and said nothing` }

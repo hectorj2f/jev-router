@@ -211,6 +211,30 @@ def main() -> int:
                            "reasoning_effort"},
           f"keys {sorted(upd)}")
 
+    # The irreversibility warning rides the reason line, which is the only
+    # voice a PreToolUse hook has. Half the dispatches by construction -- a
+    # decision that changes nothing sends no output at all -- but the half it
+    # reaches used to say nothing about it either.
+    code, out = run({**event(**spawn(message=DEEP, task_name="deploy_staging")),
+                     "model": "gpt-6-luna"},
+                    plan={**PLAN, "model": "astra", "effort": "high",
+                          "advice": {"confirm": True, "clarify": False},
+                          "signals": {"irreversible": 0.94}})
+    said = (json.loads(out)["hookSpecificOutput"]
+            .get("permissionDecisionReason", "") if out else "")
+    check("an irreversible dispatch is warned about on the reason line",
+          code == 0 and "irreversible 0.94" in said and "not a gate" in said,
+          f"got {said[:160]!r}")
+    code, out = run({**event(**spawn(message=DEEP)), "model": "gpt-6-luna"},
+                    plan={**PLAN, "model": "astra", "effort": "high",
+                          "advice": {"confirm": False, "clarify": True},
+                          "signals": {"irreversible": 0.02}})
+    quiet = (json.loads(out)["hookSpecificOutput"]
+             .get("permissionDecisionReason", "") if out else "")
+    check("a reversible one says nothing about writing anywhere",
+          code == 0 and "jev: luna -> astra" in quiet
+          and "irreversible" not in quiet, f"got {quiet[:160]!r}")
+
     # A downgrade carries the cheap rung's effort with it, rather than leaving
     # the effort the caller chose for a model that is no longer being used.
     code, out = run({**event(**spawn(reasoning_effort="high")),

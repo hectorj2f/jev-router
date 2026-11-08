@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """The routing policy, in one place.
 
-Every surface that routes -- the `cj` launcher, the PreToolUse hook on the Agent
-tool, the PreModelSwitch guard, the status line advisor -- imports from here, so
-tuning happens once rather than in four drifting copies.
+Every surface that routes comes through here -- the Claude Code mod on
+`agent.spawn`, the PreToolUse hooks on Claude's `Agent` tool and on Codex's
+`spawn_agent`, and route.py's fan-out, which is also what the mod shells out
+to. So tuning happens once rather than in four drifting copies.
+
+That is a claim this file has to keep earning. It once named four surfaces of
+which three did not exist, which is the same drift one level up: a reader
+checking whether a number is spelled anywhere else was sent to look in the
+wrong places.
 """
 
 from __future__ import annotations
@@ -23,6 +29,18 @@ from jev import model_name, system_one  # noqa: E402
 
 CACHE_DIR = pathlib.Path(__file__).parent / "cache"
 CACHE_TTL = 7 * 24 * 3600
+
+# How much of a task is worth scoring. Jev charges for input, and a dispatch
+# prompt past this is a pathological case rather than a task description.
+#
+# Enforced in ask_meta, which every routing path reaches, because it was
+# previously enforced by each caller instead: hook_agent.py, hook_codex.py,
+# hooks/register.js and an assertion in tests/register.test.ts each spelled
+# this number, while route.py -- the fan-out, and the one the mod shells out
+# to -- applied no cap at all and sent whatever it was handed. jev.py's
+# STATE_CHAR_LIMIT is a different number answering a different question; see
+# the comment there.
+STATE_LIMIT = 60_000
 
 # Atomic questions rather than one "which model" choice. Which tier a task
 # deserves depends on our cost tolerance, not on the task, so that half belongs
@@ -128,10 +146,26 @@ def available_tiers(provider: types.ModuleType | None = None) -> list[str]:
     prov = provider if provider is not None else PROVIDER
     ladder = prov.TIERS
 
+    rejected = False
     explicit = os.environ.get("JEV_TIERS", "").strip()
     if explicit:
-        want = {t.strip() for t in explicit.split(",")}
-        return [t for t in ladder if t in want] or list(ladder)
+        want = [t.strip() for t in explicit.split(",") if t.strip()]
+        unknown = [t for t in want if t not in ladder]
+        if want and not unknown:
+            return [t for t in ladder if t in want]
+        # Honouring the half that parsed is how `JEV_TIERS=haiku,sonet` quietly
+        # became "haiku only" -- every dispatch to the cheapest rung, off one
+        # transposed letter, with nothing said.
+        #
+        # A list that does not describe this ladder is not about this ladder.
+        # It is a typo, or it is another provider's rungs still exported in
+        # the shell -- hook_codex.py sets JEV_PROVIDER itself, so a JEV_TIERS
+        # written for Claude reaches the codex ladder intact. Say so, and fall
+        # through to something measured rather than guess which half was meant.
+        rejected = True
+        print(f"jev: ignoring JEV_TIERS={explicit!r}: "
+              f"{', '.join(unknown) or 'no tier names in it'} -- the "
+              f"{prov.NAME} ladder is {', '.join(ladder)}", file=sys.stderr)
 
     # A provider that can answer this itself beats a probe record: codex-cli
     # caches the catalogue its own account was granted, so the measurement is
@@ -150,7 +184,13 @@ def available_tiers(provider: types.ModuleType | None = None) -> list[str]:
         rec = json.loads(_tiers_file(prov).read_text())
         recorded, resolved = rec["tiers"], rec.get("resolved", {})
     except (OSError, json.JSONDecodeError, KeyError):
-        return list(ladder)
+        # The un-probed default is the full ladder -- but only for someone who
+        # never claimed to know better. After a rejected JEV_TIERS it would be
+        # the widest possible answer to the one input that said "these are the
+        # tiers I have", and the docstring above calls emitting an unserved
+        # tier the worst outcome there is. Empty disables routing in decide(),
+        # which costs the saving and nothing else.
+        return [] if rejected else list(ladder)
 
     out = []
     for t in ladder:
@@ -274,8 +314,14 @@ def ask_meta(state: str, cache: bool = True) -> dict:
     Memoized on disk by task text, question set and requested model. The hooks
     can see the same task more than once, so an uncached call here would mean a
     request per sighting.
+
+    `state` is cut to STATE_LIMIT here rather than by each caller -- see the
+    constant for what that cost.
     """
     requested = model_name()
+    # Before the cache key, not after, so one task does not land under two
+    # keys depending on which caller trimmed it first.
+    state = state[:STATE_LIMIT]
     path = _cache_path(state, requested) if cache else None
     if path is not None:
         # OSError included, and the stat inside the try: one unreadable entry
@@ -420,6 +466,32 @@ def route(state: str, default: str | None = None, cache: bool = True) -> dict:
                     for name, a in meta["answers"].items()},
     }
     return plan
+
+
+def decision_reason(default: str, plan: dict) -> str:
+    """The one line a PreToolUse hook gets to say, on both hosts.
+
+    A hook's only voice is `permissionDecisionReason`, which rides on a verdict
+    -- so this is reachable only where the router actually re-tiered something.
+    The mod says the same things through `$.ui.log` and is not limited that
+    way. Shared rather than written twice because it was written twice, and
+    the half that was missing from both was the irreversibility warning the
+    advice section of the README spends a page arguing for.
+    """
+    line = (f"jev: {default} -> {plan['model']} "
+            f"(need {plan['need']}, conf {plan['conf']})")
+    if (plan.get("advice") or {}).get("confirm"):
+        # Appended rather than sent as its own output: a second message would
+        # mean speaking about a spawn on a path where the hook would otherwise
+        # stay silent, and the only way a PreToolUse hook can speak is by
+        # returning a verdict on the tool call. Turning a router into a thing
+        # that approves tool calls is the wrong trade for a warning.
+        irreversible = (plan.get("signals") or {}).get("irreversible")
+        line += ("; writes outside the working tree"
+                 + (f" (irreversible {irreversible:.2f})"
+                    if isinstance(irreversible, (int, float)) else "")
+                 + " -- a warning, not a gate")
+    return line
 
 
 def _reader(name: str):
